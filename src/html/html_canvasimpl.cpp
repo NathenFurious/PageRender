@@ -79,6 +79,8 @@
 #include <QLocale>
 #include <QImage>
 #include <QBuffer>
+#include <QImageWriter>
+#include <QVector>
 #include <QByteArray>
 #include <QBrush>
 #include <QPen>
@@ -269,6 +271,12 @@ void HTMLCanvasElementImpl::markUnsafe()
 
 QString HTMLCanvasElementImpl::toDataURL(int &exceptionCode)
 {
+    return toDataURL(QString(), -1.0, exceptionCode);
+}
+
+QString HTMLCanvasElementImpl::toDataURL(const QString &typeIn, double quality, int &exceptionCode)
+{
+    exceptionCode = 0;
     if (isUnsafe()) {
         exceptionCode = DOMException::INVALID_ACCESS_ERR;
         return QString();
@@ -277,19 +285,47 @@ QString HTMLCanvasElementImpl::toDataURL(int &exceptionCode)
     khtmlImLoad::CanvasImage *ci = getCanvasImage();
     context->syncBackBuffer();
 
-    QByteArray pngBytes;
-    QBuffer    pngSink(&pngBytes);
-    if (!pngSink.open(QIODevice::WriteOnly)) {
+    // Pick the encoder; anything we can't produce falls back to PNG, per spec.
+    QString type = typeIn.trimmed().toLower();
+    const char *format = "PNG";
+    QString mime = QString::fromLatin1("image/png");
+    if (type == QLatin1String("image/jpeg")) {
+        format = "JPEG";
+        mime = type;
+    } else if (type == QLatin1String("image/webp") &&
+               QImageWriter::supportedImageFormats().contains("webp")) {
+        format = "WEBP";
+        mime = type;
+    }
+
+    QImage out;
+    if (qstrcmp(format, "JPEG") == 0) {
+        // JPEG has no alpha: composite over opaque black, as the spec says.
+        out = QImage(ci->qimage()->size(), QImage::Format_RGB32);
+        out.fill(Qt::black);
+        QPainter p(&out);
+        p.drawImage(0, 0, *ci->qimage());
+        p.end();
+    } else {
+        out = *ci->qimage();
+    }
+
+    const int q = (quality >= 0.0 && quality <= 1.0) ? qRound(quality * 100.0) : -1;
+
+    QByteArray bytes;
+    QBuffer sink(&bytes);
+    if (!sink.open(QIODevice::WriteOnly)) {
         return QString::fromLatin1("data:,");
     }
-    const bool saved = ci->qimage()->save(&pngSink, "PNG");
-    pngSink.close();
+    const bool saved = out.save(&sink, format, q);
+    sink.close();
 
-    if (!saved || pngBytes.isEmpty()) {
+    if (!saved || bytes.isEmpty()) {
         return QString::fromLatin1("data:,"); // what the spec says for "can't encode"
     }
 
-    return QString::fromLatin1("data:image/png;base64,") + QString::fromLatin1(pngBytes.toBase64());
+    return QString::fromLatin1("data:") + mime + QString::fromLatin1(";base64,") +
+           QString::fromLatin1(bytes.toBase64());
 }
 
 // -------------------------------------------------------------------------
@@ -333,6 +369,7 @@ void CanvasContext2DImpl::resetContext(int width, int height)
     defaultState.clipping = false;
 
     defaultState.globalAlpha = 1.0f;
+    defaultState.imageSmoothing = true;
     defaultState.globalCompositeOperation = QPainter::CompositionMode_SourceOver;
 
     defaultState.strokeStyle = new CanvasColorImpl(QColor(Qt::black));
@@ -342,6 +379,8 @@ void CanvasContext2DImpl::resetContext(int width, int height)
     defaultState.lineCap    = Qt::FlatCap;
     defaultState.lineJoin   = Qt::SvgMiterJoin;
     defaultState.miterLimit = 10.0f;
+    defaultState.lineDash.clear();
+    defaultState.lineDashOffset = 0.0f;
 
     defaultState.shadowOffsetX = 0.0f;
     defaultState.shadowOffsetY = 0.0f;
@@ -375,7 +414,6 @@ QPainter *CanvasContext2DImpl::acquirePainter()
     if (!workPainter.isActive()) {
         workPainter.begin(canvasImage->qimage());
         workPainter.setRenderHint(QPainter::Antialiasing);
-        workPainter.setRenderHint(QPainter::SmoothPixmapTransform);
         dirty = DrtAll;
     }
 
@@ -389,6 +427,9 @@ QPainter *CanvasContext2DImpl::acquirePainter()
         }
     }
 
+    if (dirty & DrtSmooth) {
+        workPainter.setRenderHint(QPainter::SmoothPixmapTransform, state.imageSmoothing);
+    }
     if (dirty & DrtAlpha) {
         workPainter.setOpacity(state.globalAlpha);
     }
@@ -546,6 +587,13 @@ void CanvasContext2DImpl::setTransform(float m11, float m12, float m21, float m2
     transform(m11, m12, m21, m22, dx, dy);
 }
 
+void CanvasContext2DImpl::resetTransform()
+{
+    activeState().transform.reset();
+    activeState().infinityTransform = false;
+    dirty |= DrtTransform;
+}
+
 // Composition state setting
 //
 
@@ -576,6 +624,18 @@ static const IDTranslator<QString, QPainter::CompositionMode, const char *>::Inf
     {"lighter", QPainter::CompositionMode_Plus},
     {"copy",    QPainter::CompositionMode_Source},
     {"xor",     QPainter::CompositionMode_Xor},
+    // Blend modes
+    {"multiply",    QPainter::CompositionMode_Multiply},
+    {"screen",      QPainter::CompositionMode_Screen},
+    {"overlay",     QPainter::CompositionMode_Overlay},
+    {"darken",      QPainter::CompositionMode_Darken},
+    {"lighten",     QPainter::CompositionMode_Lighten},
+    {"color-dodge", QPainter::CompositionMode_ColorDodge},
+    {"color-burn",  QPainter::CompositionMode_ColorBurn},
+    {"hard-light",  QPainter::CompositionMode_HardLight},
+    {"soft-light",  QPainter::CompositionMode_SoftLight},
+    {"difference",  QPainter::CompositionMode_Difference},
+    {"exclusion",   QPainter::CompositionMode_Exclusion},
     {nullptr, (QPainter::CompositionMode)0}
 };
 
@@ -594,6 +654,17 @@ void CanvasContext2DImpl::setGlobalCompositeOperation(const DOM::DOMString &op)
     }
     activeState().globalCompositeOperation = compModeTranslator()->toRight(opStr);
     dirty |= DrtCompOp;
+}
+
+bool CanvasContext2DImpl::imageSmoothingEnabled() const
+{
+    return activeState().imageSmoothing;
+}
+
+void CanvasContext2DImpl::setImageSmoothingEnabled(bool enabled)
+{
+    activeState().imageSmoothing = enabled;
+    dirty |= DrtSmooth;
 }
 
 // Colors and styles.
@@ -991,6 +1062,45 @@ void CanvasContext2DImpl::setLineWidth(float newLW)
     dirty |= DrtStroke;
 }
 
+void CanvasContext2DImpl::setLineDash(const QVector<qreal> &segments)
+{
+    qreal sum = 0;
+    for (int i = 0; i < segments.size(); ++i) {
+        const qreal v = segments.at(i);
+        if (isInfArg(float(v)) || v < 0) {
+            return; // spec: invalid list is ignored
+        }
+        sum += v;
+    }
+
+    QVector<qreal> dash = segments;
+    if (dash.size() % 2) {
+        dash += segments; // odd count: repeat the list
+    }
+    if (sum <= 0) {
+        dash.clear(); // all zeros == solid line (and would hang the stroker)
+    }
+    activeState().lineDash = dash;
+}
+
+QVector<qreal> CanvasContext2DImpl::lineDash() const
+{
+    return activeState().lineDash;
+}
+
+float CanvasContext2DImpl::lineDashOffset() const
+{
+    return activeState().lineDashOffset;
+}
+
+void CanvasContext2DImpl::setLineDashOffset(float offset)
+{
+    if (isInfArg(offset)) {
+        return;
+    }
+    activeState().lineDashOffset = offset;
+}
+
 static const IDTranslator<QString, Qt::PenCapStyle, const char *>::Info penCapTranslatorTable[] = {
     {"round", Qt::RoundCap},
     {"square", Qt::SquareCap},
@@ -1284,10 +1394,40 @@ QPainterPath CanvasContext2DImpl::clipForPatternRepeat(QPainter *p, PathPaintOp 
     return path * ctm;
 }
 
+QPainterPath CanvasContext2DImpl::strokeOutline(const QPainterPath &devicePath) const
+{
+    const PaintState &state = activeState();
+    if (!state.transform.isInvertible()) {
+        return QPainterPath(); // degenerate transform: nothing to draw
+    }
+
+    QPainterPathStroker stroker;
+    stroker.setCapStyle(state.lineCap);
+    stroker.setJoinStyle(state.lineJoin);
+    stroker.setMiterLimit(state.miterLimit);
+    stroker.setWidth(state.lineWidth);
+
+    if (!state.lineDash.isEmpty()) {
+        // Qt measures dashes in multiples of the pen width; canvas uses user units.
+        QVector<qreal> pattern;
+        pattern.reserve(state.lineDash.size());
+        for (int i = 0; i < state.lineDash.size(); ++i) {
+            pattern.append(state.lineDash.at(i) / state.lineWidth);
+        }
+        stroker.setDashPattern(pattern);
+        stroker.setDashOffset(state.lineDashOffset / state.lineWidth);
+    }
+
+    if (state.transform.isIdentity()) {
+        return stroker.createStroke(devicePath);
+    }
+    // Stroke in user space so non-uniform scales distort the pen, as specified.
+    return stroker.createStroke(devicePath * state.transform.inverted()) * state.transform;
+}
+
 void CanvasContext2DImpl::drawPath(QPainter *p, const QPainterPath &path, const PathPaintOp op) const
 {
     const PaintState &state = activeState();
-    QPainterPathStroker stroker;
     QPainterPath fillPath;
     QBrush brush;
 
@@ -1298,18 +1438,7 @@ void CanvasContext2DImpl::drawPath(QPainter *p, const QPainterPath &path, const 
     switch (op) {
     case DrawStroke:
         brush = p->pen().brush();
-        stroker.setCapStyle(state.lineCap);
-        stroker.setJoinStyle(state.lineJoin);
-        stroker.setMiterLimit(state.miterLimit);
-        stroker.setWidth(state.lineWidth);
-        if (state.transform.isIdentity()) {
-            fillPath = stroker.createStroke(path);
-        } else if (state.transform.isInvertible()) {
-            // Stroke in user space so that non-uniform scales distort the pen, as specified.
-            fillPath = stroker.createStroke(path * state.transform.inverted()) * state.transform;
-        } else {
-            return; // degenerate transform: nothing to draw (we used to draw an untransformed stroke)
-        }
+        fillPath = strokeOutline(path);
         break;
 
     case DrawFill:
@@ -1459,6 +1588,14 @@ bool CanvasContext2DImpl::isPointInPath(float x, float y) const
     // The path is stored in device space, so the query point (user space) has to
     // go through the CTM too. Previously it was compared untransformed.
     return path.contains(mapToDevice(x, y));
+}
+
+bool CanvasContext2DImpl::isPointInStroke(float x, float y) const
+{
+    if (anyNonFinite(x, y) || path.isEmpty()) {
+        return false;
+    }
+    return strokeOutline(path).contains(mapToDevice(x, y));
 }
 
 void CanvasContext2DImpl::arcTo(float x1, float y1, float x2, float y2, float radius, int &exceptionCode)
@@ -1635,6 +1772,46 @@ void CanvasContext2DImpl::arc(float x, float y, float radius, float startAngle, 
         }
     }
     emptyPath = false;
+}
+
+void CanvasContext2DImpl::ellipse(float x, float y, float radiusX, float radiusY, float rotation,
+                                  float startAngle, float endAngle, bool counterClockWise,
+                                  int &exceptionCode)
+{
+    exceptionCode = 0;
+
+    if (anyNonFinite(x, y, radiusX, radiusY, rotation, startAngle, endAngle)) {
+        return;
+    }
+
+    if (radiusX < 0 || radiusY < 0) {
+        exceptionCode = DOMException::INDEX_SIZE_ERR;
+        return;
+    }
+
+    if (radiusX == 0 || radiusY == 0) {
+        // Degenerate: a point / line to it, like a zero-radius arc.
+        if (isPathEmpty()) {
+            path.moveTo(mapToDevice(x, y));
+        } else {
+            path.lineTo(mapToDevice(x, y));
+        }
+        emptyPath = false;
+        return;
+    }
+
+    // Draw a unit-circle arc under a temporarily extended CTM, so the ellipse
+    // is exact (no bezier-approximation of scaling) and reuses arc()'s logic.
+    PaintState &state = activeState();
+    const QTransform saved = state.transform;
+    state.transform.translate(x, y);
+    state.transform.rotateRadians(rotation);
+    state.transform.scale(radiusX, radiusY);
+
+    int dummy;
+    arc(0, 0, 1, startAngle, endAngle, counterClockWise, dummy);
+
+    activeState().transform = saved;
 }
 
 void CanvasContext2DImpl::drawImage(QPainter *p, const QRectF &dstRect, const QImage &image, const QRectF &srcRect) const
@@ -1820,6 +1997,17 @@ CanvasImageDataImpl *CanvasContext2DImpl::getImageData(float sx, float sy, float
 
 void CanvasContext2DImpl::putImageData(CanvasImageDataImpl *id, float dx, float dy, int &exceptionCode)
 {
+    if (!id) {
+        exceptionCode = DOMException::TYPE_MISMATCH_ERR;
+        return;
+    }
+    putImageData(id, dx, dy, 0, 0, id->width(), id->height(), exceptionCode);
+}
+
+void CanvasContext2DImpl::putImageData(CanvasImageDataImpl *id, float dx, float dy,
+                                       float dirtyX, float dirtyY, float dirtyWidth, float dirtyHeight,
+                                       int &exceptionCode)
+{
     exceptionCode = 0;
 
     if (!id) {
@@ -1827,8 +2015,23 @@ void CanvasContext2DImpl::putImageData(CanvasImageDataImpl *id, float dx, float 
         return;
     }
 
-    if (anyNonFinite(dx, dy)) {
+    if (anyNonFinite(dx, dy, dirtyX, dirtyY, dirtyWidth, dirtyHeight)) {
         exceptionCode = DOMException::NOT_SUPPORTED_ERR;
+        return;
+    }
+
+    // Negative dirty sizes flip the rectangle; then clamp it to the image.
+    if (dirtyWidth < 0) {
+        dirtyX += dirtyWidth;
+        dirtyWidth = -dirtyWidth;
+    }
+    if (dirtyHeight < 0) {
+        dirtyY += dirtyHeight;
+        dirtyHeight = -dirtyHeight;
+    }
+    const QRect src = QRect(safeRound(dirtyX), safeRound(dirtyY),
+                            safeRound(dirtyWidth), safeRound(dirtyHeight)) & id->data.rect();
+    if (src.isEmpty()) {
         return;
     }
 
@@ -1839,10 +2042,8 @@ void CanvasContext2DImpl::putImageData(CanvasImageDataImpl *id, float dx, float 
     // Hence we need to mark ourselves dirty, too
     needRendererUpdate();
     QPainter p(canvasImage->qimage());
-    int x = safeRound(dx);
-    int y = safeRound(dy);
     p.setCompositionMode(QPainter::CompositionMode_Source);
-    p.drawImage(x, y, id->data);
+    p.drawImage(QPoint(safeRound(dx) + src.x(), safeRound(dy) + src.y()), id->data, src);
     p.end();
 }
 
