@@ -36,6 +36,7 @@
 
 #include "xml/xml_tokenizer.h"
 #include "xml/dom2_eventsimpl.h"
+#include "xml/dom_textimpl.h"
 
 #include <khtml_global.h>
 #include "rendering/render_object.h"
@@ -43,6 +44,7 @@
 
 #include "khtml_debug.h"
 #include <QDBusConnection>
+#include <QDBusReply>
 #include <kcookiejar_interface.h>
 
 #include "css/cssproperties.h"
@@ -52,6 +54,12 @@
 
 using namespace DOM;
 using namespace khtml;
+
+// Same ceiling browsers use for a single cookie (name + attributes + value).
+static const int kMaxCookieLength = 4096;
+
+// How long we are willing to block the UI thread on the cookie daemon.
+static const int kCookieDBusTimeoutMs = 3000;
 
 HTMLDocumentImpl::HTMLDocumentImpl(KHTMLView *v)
     : DocumentImpl(v)
@@ -102,6 +110,9 @@ DOMString HTMLDocumentImpl::cookie() const
     }
 
     org::kde::KCookieServer kcookiejar("org.kde.kded5", "/modules/kcookiejar", QDBusConnection::sessionBus());
+    // This is a synchronous call from script; don't let a wedged kded freeze the
+    // page for the default 25 seconds.
+    kcookiejar.setTimeout(kCookieDBusTimeoutMs);
     QDBusReply<QString> reply = kcookiejar.findDOMCookies(URL().url(), qlonglong(windowId));
 
     if (!reply.isValid()) {
@@ -114,6 +125,19 @@ DOMString HTMLDocumentImpl::cookie() const
 
 void HTMLDocumentImpl::setCookie(const DOMString &value)
 {
+    // The value is spliced into a fake "Set-Cookie: ...\n" header block that the
+    // cookie jar parses line by line. A script-supplied CR/LF would therefore be
+    // able to smuggle in extra Set-Cookie lines with attributes (Domain, HttpOnly,
+    // ...) that document.cookie must never be able to set. Like other browsers,
+    // refuse cookies containing control separators or that are absurdly large.
+    const QString raw = value.string();
+    if (raw.size() > kMaxCookieLength ||
+            raw.contains(QLatin1Char('\n')) ||
+            raw.contains(QLatin1Char('\r')) ||
+            raw.contains(QChar(0))) {
+        return;
+    }
+
     WId windowId = 0;
     KHTMLView *v = view();
 
@@ -122,7 +146,7 @@ void HTMLDocumentImpl::setCookie(const DOMString &value)
     }
 
     QByteArray fake_header("Set-Cookie: ");
-    fake_header.append(value.string().toLatin1().constData());
+    fake_header.append(raw.toLatin1().constData());
     fake_header.append("\n");
     // Note that kded modules are autoloaded so we don't need to call loadModule ourselves.
     org::kde::KCookieServer kcookiejar("org.kde.kded5", "/modules/kcookiejar", QDBusConnection::sessionBus());
@@ -133,15 +157,25 @@ void HTMLDocumentImpl::setCookie(const DOMString &value)
 
 void HTMLDocumentImpl::setBody(HTMLElementImpl *_body, int &exceptioncode)
 {
-    HTMLElementImpl *b = body();
-    if (!_body) {
+    // document.body may only be a <body> or a <frameset>
+    if (!_body || (_body->id() != ID_BODY && _body->id() != ID_FRAMESET)) {
         exceptioncode = DOMException::HIERARCHY_REQUEST_ERR;
         return;
     }
+
+    // Without a root element there is nothing to hang the body on (this used to
+    // dereference a null documentElement()).
+    ElementImpl *root = documentElement();
+    if (!root) {
+        exceptioncode = DOMException::HIERARCHY_REQUEST_ERR;
+        return;
+    }
+
+    HTMLElementImpl *b = body();
     if (!b) {
-        documentElement()->appendChild(_body, exceptioncode);
+        root->appendChild(_body, exceptioncode);
     } else {
-        documentElement()->replaceChild(_body, b, exceptioncode);
+        root->replaceChild(_body, b, exceptioncode);
     }
 }
 
@@ -182,21 +216,29 @@ ElementImpl *HTMLDocumentImpl::activeElement() const
 
 void HTMLDocumentImpl::slotHistoryChanged()
 {
-    if (true || !m_render) {
+    // Restyling visited links on history changes is disabled for now (it used to
+    // sit behind an unconditional "if (true || ...) return;"). The old body is
+    // kept below for whoever turns it back on.
+    return;
+
+#if 0
+    if (!m_render) {
         return;
     }
 
     recalcStyle(Force);
     m_render->repaint();
+#endif
 }
 
 HTMLMapElementImpl *HTMLDocumentImpl::getMap(const DOMString &_url)
 {
-    QString url = _url.string();
-    QString s;
-    int pos = url.indexOf('#');
-    //qCDebug(KHTML_LOG) << "map pos of #:" << pos;
-    s = QString(_url.unicode() + pos + 1, _url.length() - pos - 1);
+    const QString url = _url.string();
+
+    // usemap="#name": the map is whatever follows the '#'. A reference without
+    // a '#' is looked up as-is, as before.
+    const int pos = url.indexOf(QLatin1Char('#'));
+    const QString s = (pos >= 0) ? url.mid(pos + 1) : url;
 
     QMap<QString, HTMLMapElementImpl *>::const_iterator it = mapMap.constFind(s);
 
@@ -211,11 +253,15 @@ void HTMLDocumentImpl::contentLoaded()
 {
     // auto fill: walk the tree and try to fill in login credentials
     if (view() && m_doAutoFill) {
-        for (NodeImpl *n = this; n; n = n->traverseNextNode())
+        // Clear the flag first so a re-entrant call (autofill can run script
+        // and spin the event loop) can't fill the same forms twice.
+        m_doAutoFill = false;
+
+        for (NodeImpl *n = this; n; n = n->traverseNextNode()) {
             if (n->id() == ID_FORM) {
                 static_cast<HTMLFormElementImpl *>(n)->doAutoFill();
             }
-        m_doAutoFill = false;
+        }
     }
 }
 
@@ -243,6 +289,7 @@ void HTMLDocumentImpl::close()
         document()->dispatchWindowEvent(EventImpl::LOAD_EVENT, false, false);
 
         // don't update rendering if we're going to redirect anyway
+        // (part() is re-evaluated: the load handler may have navigated away)
         if (part() && (part()->d->m_redirectURL.isEmpty() ||
                        part()->d->m_delayRedirect > 1)) {
             updateRendering();
@@ -275,7 +322,11 @@ void HTMLDocumentImpl::changeModes(ParseMode newPMode, HTMLMode newHMode)
     }
     m_htmlCompat = (hMode != XHtml);
 
-    m_styleSelector->strictParsing = !inCompatMode();
+    // The style selector doesn't exist yet for documents that haven't been
+    // attached to a view; it picks the mode up when it is created.
+    if (m_styleSelector) {
+        m_styleSelector->strictParsing = !inCompatMode();
+    }
 
 #if 0
     qCDebug(KHTML_LOG) << "DocumentImpl::determineParseMode: publicId =" << publicID << " systemId = " << systemID;
@@ -355,11 +406,11 @@ public:
     void end() override
     {
         emit finishedParsing();
-    };
+    }
     void finish() override
     {
         end();
-    };
+    }
 
     // We don't support any inline scripts here
     bool isWaitingForScripts() const override
@@ -370,23 +421,30 @@ public:
     {
         return false;
     }
-    void executeScriptsWaitingForStylesheets() override {};
+    void executeScriptsWaitingForStylesheets() override {}
 private:
     DOM::HTMLDocumentImpl *m_doc;
 };
 
 void HTMLTextTokenizer::begin()
 {
-    int dummy;
-    DOM::ElementImpl *html = m_doc->createElement("html", &dummy);
-    DOM::ElementImpl *head = m_doc->createElement("head", &dummy);
-    DOM::ElementImpl *body = m_doc->createElement("body", &dummy);
-    DOM::ElementImpl *pre  = m_doc->createElement("pre", &dummy);
+    int dummy = 0;
 
-    m_doc->appendChild(html, dummy);
-    html->appendChild(head, dummy);
-    html->appendChild(body, dummy);
-    body->appendChild(pre, dummy);
+    // Hold references while we build the skeleton so nothing leaks if an
+    // appendChild() is refused (the DOM only takes its own reference on success).
+    RefPtr<DOM::ElementImpl> html = m_doc->createElement("html", &dummy);
+    RefPtr<DOM::ElementImpl> head = m_doc->createElement("head", &dummy);
+    RefPtr<DOM::ElementImpl> body = m_doc->createElement("body", &dummy);
+    RefPtr<DOM::ElementImpl> pre  = m_doc->createElement("pre", &dummy);
+
+    if (!html || !head || !body || !pre) {
+        return;
+    }
+
+    m_doc->appendChild(html.get(), dummy);
+    html->appendChild(head.get(), dummy);
+    html->appendChild(body.get(), dummy);
+    body->appendChild(pre.get(), dummy);
 }
 
 void HTMLTextTokenizer::write(const TokenizerString &str, bool /*appendData*/)
@@ -396,9 +454,32 @@ void HTMLTextTokenizer::write(const TokenizerString &str, bool /*appendData*/)
     // the pre again, and append to it, even for document.write mess
     // and the like.
     RefPtr<NodeListImpl> coll = m_doc->getElementsByTagName("pre");
-    if (coll->length() >= 1ul) {
-        int dummy;
-        coll->item(0)->appendChild(m_doc->createTextNode(str.toString()), dummy);
+
+    // item(0) stops at the first match; the old code called length() first,
+    // which walked the *entire* document on every chunk (quadratic for big files).
+    NodeImpl *pre = coll->item(0);
+    if (!pre) {
+        return;
+    }
+
+    int exceptionCode = 0;
+    const QString chunk = str.toString();
+
+    // Grow the existing trailing text node rather than creating one node per
+    // network chunk: a large plain-text file used to produce thousands of
+    // sibling text nodes.
+    NodeImpl *last = pre->lastChild();
+    if (last && last->nodeType() == Node::TEXT_NODE) {
+        static_cast<TextImpl *>(last)->appendData(DOMString(chunk), exceptionCode);
+        if (!exceptionCode) {
+            return;
+        }
+        exceptionCode = 0; // fall back to a fresh node
+    }
+
+    RefPtr<TextImpl> text = m_doc->createTextNode(chunk);
+    if (text) {
+        pre->appendChild(text.get(), exceptionCode);
     }
 }
 
