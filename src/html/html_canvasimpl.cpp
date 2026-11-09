@@ -43,6 +43,12 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+/*
+ * Revised implementation. The public interface (html_canvasimpl.h) is unchanged;
+ * all changes are internal: crash/UB fixes, spec conformance, and hardening.
+ * See the summary delivered with this file for the full list.
+ */
+
 #include "html_canvasimpl.h"
 #include "html_documentimpl.h"
 
@@ -72,6 +78,17 @@
 #include <QPoint>
 #include <QLocale>
 #include <QImage>
+#include <QBuffer>
+#include <QByteArray>
+#include <QBrush>
+#include <QPen>
+#include <QLineF>
+#include <QPolygonF>
+#include <QTransform>
+#include <QPainter>
+#include <QPainterPath>
+#include <QLinearGradient>
+#include <QRadialGradient>
 #include "khtml_debug.h"
 #include <cmath>
 #include <limits>
@@ -85,13 +102,75 @@ using namespace std;
 #undef fmod
 #endif
 
+// MSVC only defines these with _USE_MATH_DEFINES
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+#ifndef M_PI_2
+#define M_PI_2 1.57079632679489661923
+#endif
+
+// -------------------------------------------------------------------------
+// Local helpers
+// -------------------------------------------------------------------------
+
+static const int kDefaultCanvasWidth  = 300;
+static const int kDefaultCanvasHeight = 150;
+
+static inline bool isInfArg(float x)
+{
+    return KJS::isInf(x) || KJS::isNaN(x);
+}
+
+// True if any of the arguments is NaN or +/-Infinity. The canvas spec says
+// that such calls are silently ignored.
+static inline bool anyNonFinite()
+{
+    return false;
+}
+
+template <typename... Rest>
+static inline bool anyNonFinite(float first, Rest... rest)
+{
+    return isInfArg(first) || anyNonFinite(rest...);
+}
+
+// Rounds without invoking undefined behaviour on huge values.
+static inline int safeRound(float v)
+{
+    const float lim = 1.0e9f;
+    return qRound(qBound(-lim, v, lim));
+}
+
+static inline float degrees(float radians)
+{
+    return radians * 180.0 / M_PI;
+}
+
+// A closed, transformed rectangle as a path (device space).
+static QPainterPath transformedRectPath(const QRectF &r, const QTransform &t)
+{
+    QPainterPath p;
+    p.setFillRule(Qt::WindingFill);
+    p.addPolygon(t.map(QPolygonF(r)));
+    p.closeSubpath();
+    return p;
+}
+
+static int parseCanvasDimension(AttributeImpl *attr, int fallback)
+{
+    bool ok = false;
+    const int val = attr->val() ? attr->val()->toInt(&ok) : -1;
+    return (ok && val > 0) ? val : fallback;
+}
+
 // -------------------------------------------------------------------------
 
 HTMLCanvasElementImpl::HTMLCanvasElementImpl(DocumentImpl *doc)
     : HTMLElementImpl(doc)
 {
-    w = 300;
-    h = 150;
+    w = kDefaultCanvasWidth;
+    h = kDefaultCanvasHeight;
     unsafe = false;
 }
 
@@ -104,36 +183,35 @@ HTMLCanvasElementImpl::~HTMLCanvasElementImpl()
 
 void HTMLCanvasElementImpl::parseAttribute(AttributeImpl *attr)
 {
-    bool ok = false;
-    int  val;
     switch (attr->id()) {
     // ### TODO: making them reflect w/h -- how?
-    case ATTR_WIDTH:
-        val = attr->val() ? attr->val()->toInt(&ok) : -1;
-        if (!ok || val <= 0) {
-            w = 300;
-        } else {
-            w = val;
+    case ATTR_WIDTH: {
+        int nw = parseCanvasDimension(attr, kDefaultCanvasWidth);
+        // Refuse sizes that would make the backing store unreasonably big.
+        if (!khtmlImLoad::ImageManager::isAcceptableSize(unsigned(nw), unsigned(h))) {
+            nw = kDefaultCanvasWidth;
         }
+        w = nw;
 
         if (context) {
             context->resetContext(w, h);
         }
         setChanged();
         break;
-    case ATTR_HEIGHT:
-        val = attr->val() ? attr->val()->toInt(&ok) : -1;
-        if (!ok || val <= 0) {
-            h = 150;
-        } else {
-            h = val;
+    }
+    case ATTR_HEIGHT: {
+        int nh = parseCanvasDimension(attr, kDefaultCanvasHeight);
+        if (!khtmlImLoad::ImageManager::isAcceptableSize(unsigned(w), unsigned(nh))) {
+            nh = kDefaultCanvasHeight;
         }
+        h = nh;
 
         if (context) {
             context->resetContext(w, h);
         }
         setChanged();
         break;
+    }
     default:
         HTMLElementImpl::parseAttribute(attr);
     }
@@ -193,7 +271,7 @@ QString HTMLCanvasElementImpl::toDataURL(int &exceptionCode)
 {
     if (isUnsafe()) {
         exceptionCode = DOMException::INVALID_ACCESS_ERR;
-        return "";
+        return QString();
     }
 
     khtmlImLoad::CanvasImage *ci = getCanvasImage();
@@ -201,11 +279,17 @@ QString HTMLCanvasElementImpl::toDataURL(int &exceptionCode)
 
     QByteArray pngBytes;
     QBuffer    pngSink(&pngBytes);
-    pngSink.open(QIODevice::WriteOnly);
-    ci->qimage()->save(&pngSink, "PNG");
+    if (!pngSink.open(QIODevice::WriteOnly)) {
+        return QString::fromLatin1("data:,");
+    }
+    const bool saved = ci->qimage()->save(&pngSink, "PNG");
     pngSink.close();
 
-    return QString::fromLatin1("data:image/png;base64,") + pngBytes.toBase64();
+    if (!saved || pngBytes.isEmpty()) {
+        return QString::fromLatin1("data:,"); // what the spec says for "can't encode"
+    }
+
+    return QString::fromLatin1("data:image/png;base64,") + QString::fromLatin1(pngBytes.toBase64());
 }
 
 // -------------------------------------------------------------------------
@@ -313,7 +397,7 @@ QPainter *CanvasContext2DImpl::acquirePainter()
     }
     if (dirty & DrtStroke) {
         QPen pen;
-        pen.setWidth(state.lineWidth);
+        pen.setWidthF(state.lineWidth); // was setWidth(int): truncated fractional widths
         pen.setCapStyle(state.lineCap);
         pen.setJoinStyle(state.lineJoin);
         pen.setMiterLimit(state.miterLimit);
@@ -324,9 +408,7 @@ QPainter *CanvasContext2DImpl::acquirePainter()
         } else {
             pen.setBrush(style->toBrush());
         }
-        workPainter.setPen(pen); // ### should I even do this?
-        // I have a feeling I am mixing up path and
-        // non-path ops
+        workPainter.setPen(pen); // only used as a carrier for the stroke brush; see drawPath()
     }
     if (dirty & DrtFill) {
         workPainter.setBrush(state.fillStyle->toBrush());
@@ -343,14 +425,20 @@ QImage CanvasContext2DImpl::extractImage(ElementImpl *el, int &exceptionCode, bo
     QImage pic;
 
     exceptionCode = 0;
-
     unsafeOut = false;
-    if (el->id() == ID_CANVAS) {
-        CanvasContext2DImpl *other = static_cast<HTMLCanvasElementImpl *>(el)->getContext2D();
-        other->syncBackBuffer();
-        pic = *other->canvasImage->qimage();
 
-        if (static_cast<HTMLCanvasElementImpl *>(el)->isUnsafe()) {
+    if (!el) {
+        exceptionCode = DOMException::TYPE_MISMATCH_ERR;
+        return pic;
+    }
+
+    if (el->id() == ID_CANVAS) {
+        HTMLCanvasElementImpl *otherEl = static_cast<HTMLCanvasElementImpl *>(el);
+        CanvasContext2DImpl *other = otherEl->getContext2D();
+        other->syncBackBuffer();
+        pic = *other->canvasImage->qimage(); // implicit-shared copy; safe even if el == our canvas
+
+        if (otherEl->isUnsafe()) {
             unsafeOut = true;
         }
     } else if (el->id() == ID_IMG) {
@@ -404,74 +492,57 @@ HTMLCanvasElementImpl *CanvasContext2DImpl::canvas() const
 
 // Transformation ops
 //
-
-static inline float degrees(float radians)
-{
-    return radians * 180.0 / M_PI;
-}
-
-static inline bool isInfArg(float x)
-{
-    return KJS::isInf(x) || KJS::isNaN(x);
-}
+// Per the current spec, calls with non-finite arguments are ignored (they used
+// to poison the transform until the next setTransform()).
 
 void CanvasContext2DImpl::scale(float x, float y)
 {
-    dirty |= DrtTransform;
-
-    bool &infinityTransform = activeState().infinityTransform;
-    infinityTransform |= isInfArg(x) | isInfArg(y);
-    if (infinityTransform) {
+    if (anyNonFinite(x, y)) {
         return;
     }
 
+    dirty |= DrtTransform;
     activeState().transform.scale(x, y);
 }
 
 void CanvasContext2DImpl::rotate(float angle)
 {
-    dirty |= DrtTransform;
-
-    bool &infinityTransform = activeState().infinityTransform;
-    infinityTransform |= isInfArg(angle);
-    if (infinityTransform) {
+    if (anyNonFinite(angle)) {
         return;
     }
 
+    dirty |= DrtTransform;
     activeState().transform.rotateRadians(angle);
 }
 
 void CanvasContext2DImpl::translate(float x, float y)
 {
-    dirty |= DrtTransform;
-
-    bool &infinityTransform = activeState().infinityTransform;
-    infinityTransform |= isInfArg(x) | isInfArg(y);
-    if (infinityTransform) {
+    if (anyNonFinite(x, y)) {
         return;
     }
 
+    dirty |= DrtTransform;
     activeState().transform.translate(x, y);
 }
 
 void CanvasContext2DImpl::transform(float m11, float m12, float m21, float m22, float dx, float dy)
 {
-    dirty |= DrtTransform;
-
-    bool &infinityTransform = activeState().infinityTransform;
-    infinityTransform |= isInfArg(m11) | isInfArg(m12) | isInfArg(m21) | isInfArg(m22) |
-                         isInfArg(dx)  | isInfArg(dy);
-    if (infinityTransform) {
+    if (anyNonFinite(m11, m12, m21, m22, dx, dy)) {
         return;
     }
 
+    dirty |= DrtTransform;
     activeState().transform *= QTransform(m11, m12, 0.0f, m21, m22, 0.0f, dx, dy, 1.0f);
 }
 
 void CanvasContext2DImpl::setTransform(float m11, float m12, float m21, float m22, float dx, float dy)
 {
+    if (anyNonFinite(m11, m12, m21, m22, dx, dy)) {
+        return;
+    }
+
     activeState().transform.reset();
-    activeState().infinityTransform = false; // As cleared the matrix..
+    activeState().infinityTransform = false;
     transform(m11, m12, m21, m22, dx, dy);
 }
 
@@ -485,7 +556,7 @@ float CanvasContext2DImpl::globalAlpha() const
 
 void CanvasContext2DImpl::setGlobalAlpha(float a)
 {
-    if (a < 0.0f || a > 1.0f) {
+    if (isInfArg(a) || a < 0.0f || a > 1.0f) {
         return;
     }
 
@@ -555,20 +626,31 @@ static QColor colorFromString(DOM::DOMString domStr)
 
 static DOMString colorToString(const QColor &color)
 {
-    QString str;
-    if (color.alpha() == 255) {
-        str.sprintf("#%02x%02x%02x", color.red(), color.green(), color.blue());
-    } else {
-        QString alphaColor = QString::number(color.alphaF());
-        // Ensure we always have a decimal period
-        if ((int)color.alphaF() == color.alphaF()) {
-            alphaColor = QString::number((int)color.alphaF()) + ".0";
-        }
+    const int a = color.alpha();
 
-        str.sprintf("rgba(%d, %d, %d, ", color.red(), color.green(), color.blue());
-        str += alphaColor + ")";
+    if (a == 255) {
+        return DOMString(QString::fromLatin1("#%1%2%3")
+                         .arg(color.red(),   2, 16, QLatin1Char('0'))
+                         .arg(color.green(), 2, 16, QLatin1Char('0'))
+                         .arg(color.blue(),  2, 16, QLatin1Char('0')));
     }
-    return str;
+
+    // Use the shortest decimal alpha that still maps back to the same 8-bit value,
+    // rather than always printing things like 0.501961.
+    QString alphaStr;
+    for (int digits = 0; digits <= 3; ++digits) {
+        alphaStr = QString::number(a / 255.0, 'f', digits);
+        if (qRound(alphaStr.toDouble() * 255.0) == a) {
+            break;
+        }
+    }
+    // Ensure we always have a decimal period
+    if (!alphaStr.contains(QLatin1Char('.'))) {
+        alphaStr += QLatin1String(".0");
+    }
+
+    return DOMString(QString::fromLatin1("rgba(%1, %2, %3, %4)")
+                     .arg(color.red()).arg(color.green()).arg(color.blue()).arg(alphaStr));
 }
 
 //-------
@@ -593,18 +675,20 @@ CanvasGradientImpl::CanvasGradientImpl(QGradient *newGradient, float innerRadius
     : gradient(newGradient), innerRadius(innerRadius), inverse(inverse)
 {}
 
+// Qt doesn't support two stops at the same position, which <canvas> allows.
+// Nudge a colliding stop slightly to emulate it.
 static qreal adjustPosition(qreal pos, const QGradientStops &stops)
 {
-    QGradientStops::const_iterator itr = stops.constBegin();
     const qreal smallDiff = 0.00001;
-    while (itr != stops.constEnd()) {
-        const QGradientStop &stop = *itr;
-        ++itr;
-        bool atEnd = (itr != stops.constEnd());
-        if (qFuzzyCompare(pos, stop.first)) {
-            if (atEnd || !qFuzzyCompare(pos + smallDiff, (*itr).first)) {
-                return qMin(pos + smallDiff, qreal(1.0));
-            }
+    for (int i = 0; i < stops.size(); ++i) {
+        if (!qFuzzyCompare(pos, stops.at(i).first)) {
+            continue;
+        }
+        // Original code had this flag inverted and dereferenced end() when the
+        // colliding stop was the last one.
+        const bool isLast = (i + 1 == stops.size());
+        if (isLast || !qFuzzyCompare(pos + smallDiff, stops.at(i + 1).first)) {
+            return qMin(pos + smallDiff, qreal(1.0));
         }
     }
     return pos;
@@ -643,9 +727,6 @@ void CanvasGradientImpl::addColorStop(float offset, const DOM::DOMString &color,
         offset = innerRadius + offset * (1.0 - innerRadius);
     }
 
-    //<canvas> says that gradient can have two stops at the same position
-    //Qt doesn't handle that. We hack around that by creating a fake position
-    //stop.
     offset = adjustPosition(offset, gradient->stops());
 
     gradient->setColorAt(offset, qcolor);
@@ -713,41 +794,45 @@ unsigned CanvasImageDataImpl::height() const
     return data.height();
 }
 
-#if 0
-static inline unsigned char unpremulComponent(unsigned original, unsigned alpha)
-{
-    unsigned char val =  alpha ? (unsigned char)(original * 255 / alpha) : 0;
-    return val;
-}
-#endif
+// pixelNum comes straight from script, so it is bounds-checked here: the old
+// code did unchecked scanLine()/pixel() access, i.e. out-of-bounds read/write.
 
 QColor CanvasImageDataImpl::pixel(unsigned pixelNum) const
 {
-    int w = data.width();
-    QRgb code = data.pixel(pixelNum % w, pixelNum / w);
-    return code;
-}
+    const unsigned w = data.width();
+    const unsigned h = data.height();
+    if (w == 0 || h == 0 || pixelNum >= w * h) {
+        return QColor(0, 0, 0, 0);
+    }
 
-#if 0
-static inline unsigned char premulComponent(unsigned original, unsigned alpha)
-{
-    unsigned product = original * alpha; // this is conceptually 255 * intended value.
-    return (unsigned char)((product + product / 256 + 128) / 256);
+    QRgb code = data.pixel(pixelNum % w, pixelNum / w);
+    return QColor::fromRgba(code); // keeps alpha; QColor(QRgb) would drop it
 }
-#endif
 
 void CanvasImageDataImpl::setPixel(unsigned pixelNum, const QColor &val)
 {
-    int w = data.width();
+    const unsigned w = data.width();
+    const unsigned h = data.height();
+    if (w == 0 || h == 0 || pixelNum >= w * h) {
+        return;
+    }
+
     data.setPixel(pixelNum % w, pixelNum / w, val.rgba());
 }
 
 void CanvasImageDataImpl::setComponent(unsigned pixelNum, int component,
                                        int value)
 {
-    int w = data.width();
-    int x = pixelNum % w;
-    int y = pixelNum / w;
+    const unsigned w = data.width();
+    const unsigned h = data.height();
+    if (w == 0 || h == 0 || pixelNum >= w * h) {
+        return;
+    }
+
+    value = qBound(0, value, 255); // Uint8ClampedArray semantics
+
+    const int x = pixelNum % w;
+    const int y = pixelNum / w;
     // ### could avoid inherent QImage::detach() by a const cast
     QRgb *rgb = reinterpret_cast<QRgb *>(data.scanLine(y) + 4 * x);
 
@@ -770,13 +855,18 @@ void CanvasImageDataImpl::setComponent(unsigned pixelNum, int component,
 
 //-------
 
+// The canvas element can already be gone while script still holds the context,
+// so never dereference canvas() blindly.
+#define MARK_CANVAS_UNSAFE() \
+    do { if (HTMLCanvasElementImpl *c__ = canvas()) c__->markUnsafe(); } while (0)
+
 void CanvasContext2DImpl::setStrokeStyle(CanvasStyleBaseImpl *strokeStyle)
 {
     if (!strokeStyle) {
         return;
     }
     if (strokeStyle->isUnsafe()) {
-        canvas()->markUnsafe();
+        MARK_CANVAS_UNSAFE();
     }
 
     activeState().strokeStyle = strokeStyle;
@@ -794,7 +884,7 @@ void CanvasContext2DImpl::setFillStyle(CanvasStyleBaseImpl *fillStyle)
         return;
     }
     if (fillStyle->isUnsafe()) {
-        canvas()->markUnsafe();
+        MARK_CANVAS_UNSAFE();
     }
 
     activeState().fillStyle = fillStyle;
@@ -818,7 +908,7 @@ CanvasGradientImpl *CanvasContext2DImpl::createRadialGradient(float x0, float y0
 {
     exceptionCode = 0;
     //### fuzzy
-    if (r0 < 0.0f || r1 < 0.0f) {
+    if (anyNonFinite(x0, y0, r0, x1, y1, r1) || r0 < 0.0f || r1 < 0.0f) {
         exceptionCode = DOMException::INDEX_SIZE_ERR;
         return nullptr;
     }
@@ -894,7 +984,7 @@ float CanvasContext2DImpl::lineWidth() const
 
 void CanvasContext2DImpl::setLineWidth(float newLW)
 {
-    if (newLW <= 0.0) {
+    if (isInfArg(newLW) || newLW <= 0.0f) { // NaN used to slip through "<= 0"
         return;
     }
     activeState().lineWidth = newLW;
@@ -956,7 +1046,7 @@ float CanvasContext2DImpl::miterLimit() const
 
 void CanvasContext2DImpl::setMiterLimit(float newML)
 {
-    if (newML <= 0.0) {
+    if (isInfArg(newML) || newML <= 0.0f) {
         return;
     }
     activeState().miterLimit = newML;
@@ -972,6 +1062,9 @@ float CanvasContext2DImpl::shadowOffsetX() const
 
 void  CanvasContext2DImpl::setShadowOffsetX(float newOX)
 {
+    if (isInfArg(newOX)) {
+        return;
+    }
     activeState().shadowOffsetX = newOX;
 }
 
@@ -982,6 +1075,9 @@ float CanvasContext2DImpl::shadowOffsetY() const
 
 void  CanvasContext2DImpl::setShadowOffsetY(float newOY)
 {
+    if (isInfArg(newOY)) {
+        return;
+    }
     activeState().shadowOffsetY = newOY;
 }
 
@@ -992,7 +1088,7 @@ float CanvasContext2DImpl::shadowBlur() const
 
 void  CanvasContext2DImpl::setShadowBlur(float newBlur)
 {
-    if (newBlur < 0) {
+    if (isInfArg(newBlur) || newBlur < 0) {
         return;
     }
 
@@ -1019,47 +1115,43 @@ void CanvasContext2DImpl::setShadowColor(const DOMString &newColor)
 void CanvasContext2DImpl::clearRect(float x, float y, float w, float h, int &exceptionCode)
 {
     exceptionCode = 0;
-    if (w == 0.0f || h == 0.0f) {
+    if (anyNonFinite(x, y, w, h) || w == 0.0f || h == 0.0f) {
         return;
     }
 
     QPainter *p = acquirePainter();
-    p->setCompositionMode(QPainter::CompositionMode_Source);
-    dirty |= DrtCompOp; // We messed it up..
 
-    p->fillRect(QRectF(x, y, w, h), Qt::transparent);
+    // The old version filled an untransformed rect, so clearRect() ignored the
+    // current transform, and a partial globalAlpha only half-cleared.
+    // save()/restore() puts the painter back exactly as it was, so no dirty
+    // flags need to be touched.
+    p->save();
+    p->setOpacity(1.0);
+    p->setCompositionMode(QPainter::CompositionMode_Source);
+    p->fillPath(transformedRectPath(QRectF(x, y, w, h), activeState().transform), Qt::transparent);
+    p->restore();
 }
 
 void CanvasContext2DImpl::fillRect(float x, float y, float w, float h, int &exceptionCode)
 {
     exceptionCode = 0;
-    if (w == 0.0f || h == 0.0f) {
+    if (anyNonFinite(x, y, w, h) || w == 0.0f || h == 0.0f) {
         return;
     }
 
     QPainter *p = acquirePainter();
-
-    QPainterPath path;
-    path.addPolygon(QRectF(x, y, w, h) * activeState().transform);
-    path.closeSubpath();
-
-    drawPath(p, path, DrawFill);
+    drawPath(p, transformedRectPath(QRectF(x, y, w, h), activeState().transform), DrawFill);
 }
 
 void CanvasContext2DImpl::strokeRect(float x, float y, float w, float h, int &exceptionCode)
 {
     exceptionCode = 0;
-    if (w == 0.0f && h == 0.0f) {
+    if (anyNonFinite(x, y, w, h) || (w == 0.0f && h == 0.0f)) {
         return;
     }
 
     QPainter *p = acquirePainter();
-
-    QPainterPath path;
-    path.addPolygon(QRectF(x, y, w, h) * activeState().transform);
-    path.closeSubpath();
-
-    drawPath(p, path, DrawStroke);
+    drawPath(p, transformedRectPath(QRectF(x, y, w, h), activeState().transform), DrawStroke);
 }
 
 inline bool CanvasContext2DImpl::isPathEmpty() const
@@ -1091,51 +1183,78 @@ void CanvasContext2DImpl::closePath()
 
 void CanvasContext2DImpl::moveTo(float x, float y)
 {
+    if (anyNonFinite(x, y)) {
+        return;
+    }
+
     path.moveTo(mapToDevice(x, y));
     emptyPath = false;
 }
 
 void CanvasContext2DImpl::lineTo(float x, float y)
 {
+    if (anyNonFinite(x, y)) {
+        return;
+    }
+
     if (isPathEmpty()) {
+        // Spec: with no subpath, lineTo() behaves like moveTo().
+        // (This used to be silently dropped.)
+        path.moveTo(mapToDevice(x, y));
+        emptyPath = false;
         return;
     }
 
     path.lineTo(mapToDevice(x, y));
-    emptyPath = false;
 }
 
 void CanvasContext2DImpl::quadraticCurveTo(float cpx, float cpy, float x, float y)
 {
-    if (isPathEmpty()) {
+    if (anyNonFinite(cpx, cpy, x, y)) {
         return;
     }
 
+    if (isPathEmpty()) {
+        path.moveTo(mapToDevice(cpx, cpy));
+        emptyPath = false;
+    }
+
     path.quadTo(mapToDevice(cpx, cpy), mapToDevice(x, y));
-    emptyPath = false;
 }
 
 void CanvasContext2DImpl::bezierCurveTo(float cp1x, float cp1y, float cp2x, float cp2y, float x, float y)
 {
-    if (isPathEmpty()) {
+    if (anyNonFinite(cp1x, cp1y, cp2x, cp2y, x, y)) {
         return;
     }
 
+    if (isPathEmpty()) {
+        path.moveTo(mapToDevice(cp1x, cp1y));
+        emptyPath = false;
+    }
+
     path.cubicTo(mapToDevice(cp1x, cp1y), mapToDevice(cp2x, cp2y), mapToDevice(x, y));
-    emptyPath = false;
 }
 
 void CanvasContext2DImpl::rect(float x, float y, float w, float h, int &exceptionCode)
 {
     exceptionCode = 0;
+    if (anyNonFinite(x, y, w, h)) {
+        return;
+    }
 
-    path.addPolygon(QRectF(x, y, w, h) * activeState().transform);
+    path.addPolygon(activeState().transform.map(QPolygonF(QRectF(x, y, w, h))));
     path.closeSubpath();
+    emptyPath = false; // was missing: following lineTo()/arc() thought the path was empty
 }
 
 inline bool CanvasContext2DImpl::needsShadow() const
 {
-    return activeState().shadowColor.alpha() > 0;
+    // A shadow with no blur and no offset is invisible, so skip the (expensive)
+    // offscreen shadow pass in that case.
+    const PaintState &s = activeState();
+    return s.shadowColor.alpha() > 0 &&
+           (s.shadowBlur > 0.0f || s.shadowOffsetX != 0.0f || s.shadowOffsetY != 0.0f);
 }
 
 QPainterPath CanvasContext2DImpl::clipForPatternRepeat(QPainter *p, PathPaintOp op) const
@@ -1149,6 +1268,10 @@ QPainterPath CanvasContext2DImpl::clipForPatternRepeat(QPainter *p, PathPaintOp 
 
     const CanvasPatternImpl *pattern = static_cast<const CanvasPatternImpl *>(style);
     const QTransform &ctm = activeState().transform;
+    if (!ctm.isInvertible()) {
+        return QPainterPath();
+    }
+
     const QRectF fillBounds = ctm.inverted().mapRect(QRectF(QPointF(), canvasImage->size()));
     const QRectF clipRect = pattern->clipForRepeat(p->brushOrigin(), fillBounds);
 
@@ -1179,10 +1302,13 @@ void CanvasContext2DImpl::drawPath(QPainter *p, const QPainterPath &path, const 
         stroker.setJoinStyle(state.lineJoin);
         stroker.setMiterLimit(state.miterLimit);
         stroker.setWidth(state.lineWidth);
-        if (!state.transform.isIdentity() && state.transform.isInvertible()) {
+        if (state.transform.isIdentity()) {
+            fillPath = stroker.createStroke(path);
+        } else if (state.transform.isInvertible()) {
+            // Stroke in user space so that non-uniform scales distort the pen, as specified.
             fillPath = stroker.createStroke(path * state.transform.inverted()) * state.transform;
         } else {
-            fillPath = stroker.createStroke(path);
+            return; // degenerate transform: nothing to draw (we used to draw an untransformed stroke)
         }
         break;
 
@@ -1241,12 +1367,13 @@ void CanvasContext2DImpl::drawPathWithShadow(QPainter *p, const QPainterPath &pa
         clipRect = QRect(QPoint(), canvasImage->size());
     }
 
-    const QRect shadowRect = shapeBounds.translated(shadowOffsetX(), shadowOffsetY())
+    // Shadow offsets are in device space and ignore the CTM, per spec.
+    const QRect shadowRect = shapeBounds.translated(safeRound(shadowOffsetX()), safeRound(shadowOffsetY()))
                              .adjusted(-offset, -offset, offset, offset) &
                              clipRect.adjusted(-offset, -offset, offset, offset);
 
     const QRect shapeRect = QRect(shapeBounds & clipRect) |
-                            (shadowRect.translated(-shadowOffsetX(), -shadowOffsetY()) & shapeBounds);
+                            (shadowRect.translated(-safeRound(shadowOffsetX()), -safeRound(shadowOffsetY())) & shapeBounds);
 
     if (!shapeRect.isValid()) {
         return;
@@ -1325,14 +1452,24 @@ void CanvasContext2DImpl::clip()
 
 bool CanvasContext2DImpl::isPointInPath(float x, float y) const
 {
-    return path.contains(QPointF(x, y));
+    if (anyNonFinite(x, y)) {
+        return false;
+    }
+
+    // The path is stored in device space, so the query point (user space) has to
+    // go through the CTM too. Previously it was compared untransformed.
+    return path.contains(mapToDevice(x, y));
 }
 
 void CanvasContext2DImpl::arcTo(float x1, float y1, float x2, float y2, float radius, int &exceptionCode)
 {
     exceptionCode = 0;
 
-    if (radius <= 0) {
+    if (anyNonFinite(x1, y1, x2, y2, radius)) {
+        return;
+    }
+
+    if (radius < 0) {
         exceptionCode = DOMException::INDEX_SIZE_ERR;
         return;
     }
@@ -1341,6 +1478,12 @@ void CanvasContext2DImpl::arcTo(float x1, float y1, float x2, float y2, float ra
         moveTo(x1, y1);
     }
     emptyPath = false;
+
+    // Spec: a zero radius is just a straight line to (x1, y1). (Used to throw.)
+    if (radius == 0) {
+        path.lineTo(mapToDevice(x1, y1));
+        return;
+    }
 
     QLineF line1(QPointF(x1, y1), mapToUser(path.currentPosition()));
     QLineF line2(QPointF(x1, y1), QPointF(x2, y2));
@@ -1367,9 +1510,9 @@ void CanvasContext2DImpl::arcTo(float x1, float y1, float x2, float y2, float ra
         theta = -(2 * M_PI - theta);
     }
 
-    // If the angle between the lines is 180 degrees, the span of the arc becomes
-    // zero, causing the tangent points to converge to the same point at (x1, y1).
-    if (qFuzzyCompare(qAbs(theta), float(M_PI))) {
+    // If the angle between the lines is 180 degrees (or 0), the span of the arc
+    // becomes zero, causing the tangent points to converge to the same point at (x1, y1).
+    if (qFuzzyCompare(qAbs(theta), float(M_PI)) || qFuzzyIsNull(theta)) {
         path.lineTo(mapToDevice(x1, y1));
         return;
     }
@@ -1411,8 +1554,23 @@ void CanvasContext2DImpl::arc(float x, float y, float radius, float startAngle, 
 {
     exceptionCode = 0;
 
-    if (radius <= 0) {
+    if (anyNonFinite(x, y, radius, startAngle, endAngle)) {
+        return;
+    }
+
+    if (radius < 0) {
         exceptionCode = DOMException::INDEX_SIZE_ERR;
+        return;
+    }
+
+    if (radius == 0) {
+        // Degenerate arc: just a point / line to it.
+        if (isPathEmpty()) {
+            path.moveTo(mapToDevice(x, y));
+        } else {
+            path.lineTo(mapToDevice(x, y));
+        }
+        emptyPath = false;
         return;
     }
 
@@ -1428,7 +1586,7 @@ void CanvasContext2DImpl::arc(float x, float y, float radius, float startAngle, 
     } else if (!counterClockWise && (sweepLength > 0 || sweepLength < -360)) {
         sweepLength = -(360 - std::fmod(sweepLength, float(360.0)));
         if (qFuzzyCompare(sweepLength + 1, 1)) {
-            sweepLength = 360;
+            sweepLength = -360; // clockwise full circle (was +360, i.e. wrong direction)
         }
     }
 
@@ -1468,10 +1626,12 @@ void CanvasContext2DImpl::arc(float x, float y, float radius, float startAngle, 
             arcPath = arcPath * activeState().transform;
             path.lineTo(arcPath.elementAt(0));
 
-            if (arcPath.elementCount() > 1)
-                for (int i = 1; i < arcPath.elementCount(); i += 3)
+            if (arcPath.elementCount() > 1) {
+                for (int i = 1; i + 2 < arcPath.elementCount(); i += 3) { // bounds-safe step
                     path.cubicTo(arcPath.elementAt(i), arcPath.elementAt(i + 1),
                                  arcPath.elementAt(i + 2));
+                }
+            }
         }
     }
     emptyPath = false;
@@ -1479,7 +1639,7 @@ void CanvasContext2DImpl::arc(float x, float y, float radius, float startAngle, 
 
 void CanvasContext2DImpl::drawImage(QPainter *p, const QRectF &dstRect, const QImage &image, const QRectF &srcRect) const
 {
-    if (activeState().infinityTransform) {
+    if (activeState().infinityTransform || image.isNull()) {
         return;
     }
 
@@ -1517,12 +1677,16 @@ void CanvasContext2DImpl::drawImage(QPainter *p, const QRectF &dstRect, const QI
 void CanvasContext2DImpl::drawImage(ElementImpl *image, float dx, float dy, int &exceptionCode)
 {
     exceptionCode = 0;
+    if (anyNonFinite(dx, dy)) {
+        return;
+    }
+
     bool unsafe;
     QImage img = extractImage(image, exceptionCode, unsafe);
     if (unsafe) {
-        canvas()->markUnsafe();
+        MARK_CANVAS_UNSAFE();
     }
-    if (exceptionCode) {
+    if (exceptionCode || img.isNull()) {
         return;
     }
 
@@ -1535,12 +1699,16 @@ void CanvasContext2DImpl::drawImage(ElementImpl *image, float dx, float dy, floa
 {
     //### do we need DoS protection here?
     exceptionCode = 0;
+    if (anyNonFinite(dx, dy, dw, dh)) {
+        return;
+    }
+
     bool unsafe;
     QImage img = extractImage(image, exceptionCode, unsafe);
     if (unsafe) {
-        canvas()->markUnsafe();
+        MARK_CANVAS_UNSAFE();
     }
-    if (exceptionCode) {
+    if (exceptionCode || img.isNull()) {
         return;
     }
 
@@ -1549,7 +1717,7 @@ void CanvasContext2DImpl::drawImage(ElementImpl *image, float dx, float dy, floa
         return;
     }
 
-    if (qFuzzyCompare(dw + 1, 1) || qFuzzyCompare(dh + 1, 1)) {
+    if (qFuzzyIsNull(dw) || qFuzzyIsNull(dh)) {
         return;
     }
 
@@ -1564,12 +1732,16 @@ void CanvasContext2DImpl::drawImage(ElementImpl *image,
 {
     //### do we need DoS protection here?
     exceptionCode = 0;
+    if (anyNonFinite(sx, sy, sw, sh, dx, dy, dw, dh)) {
+        return;
+    }
+
     bool unsafe;
     QImage img = extractImage(image, exceptionCode, unsafe);
     if (unsafe) {
-        canvas()->markUnsafe();
+        MARK_CANVAS_UNSAFE();
     }
-    if (exceptionCode) {
+    if (exceptionCode || img.isNull()) {
         return;
     }
 
@@ -1579,8 +1751,8 @@ void CanvasContext2DImpl::drawImage(ElementImpl *image,
         return;
     }
 
-    if (qFuzzyCompare(sw + 1, 1) || qFuzzyCompare(sh + 1, 1) ||
-            qFuzzyCompare(dw + 1, 1) || qFuzzyCompare(dh + 1, 1)) {
+    if (qFuzzyIsNull(sw) || qFuzzyIsNull(sh) ||
+            qFuzzyIsNull(dw) || qFuzzyIsNull(dh)) {
         return;
     }
 
@@ -1589,15 +1761,27 @@ void CanvasContext2DImpl::drawImage(ElementImpl *image,
 }
 
 // Pixel stuff.
+//
+// All three entry points now set exceptionCode on every path (it used to be left
+// uninitialised on success), reject non-finite values, and bound allocations.
+
 CanvasImageDataImpl *CanvasContext2DImpl::getImageData(float sx, float sy, float sw, float sh, int &exceptionCode)
 {
-    int w = qRound(sw);
-    int h = qRound(sh);
+    exceptionCode = 0;
 
-    if (canvas()->isUnsafe()) {
+    if (anyNonFinite(sx, sy, sw, sh)) {
+        exceptionCode = DOMException::NOT_SUPPORTED_ERR;
+        return nullptr;
+    }
+
+    HTMLCanvasElementImpl *el = canvas();
+    if (el && el->isUnsafe()) {
         exceptionCode = DOMException::INVALID_ACCESS_ERR;
         return nullptr;
     }
+
+    int w = safeRound(sw);
+    int h = safeRound(sh);
 
     if (w <= 0 || h <= 0) {
         exceptionCode = DOMException::INDEX_SIZE_ERR;
@@ -1609,22 +1793,21 @@ CanvasImageDataImpl *CanvasContext2DImpl::getImageData(float sx, float sy, float
         return nullptr;
     }
 
-    int x = qRound(sx);
-    int y = qRound(sy);
+    int x = safeRound(sx);
+    int y = safeRound(sy);
 
     CanvasImageDataImpl *id = new CanvasImageDataImpl(w, h);
     id->data.fill(Qt::transparent);
 
-    // Clip the source rect again the viewport.
-
+    // Clip the source rect against the canvas bitmap (not the element, which may be gone).
     QRect srcRect = QRect(x, y, w, h);
-    QRect clpRect = srcRect & QRect(0, 0, canvasElement->width(), canvasElement->height());
+    QRect clpRect = srcRect & QRect(QPoint(), canvasImage->size());
     if (!clpRect.isEmpty()) {
-        QPainter p(&id->data);
-        p.setCompositionMode(QPainter::CompositionMode_Source);
-
         // Flush our data..
         syncBackBuffer();
+
+        QPainter p(&id->data);
+        p.setCompositionMode(QPainter::CompositionMode_Source);
 
         // Copy it over..
         QImage *backBuffer = canvasImage->qimage();
@@ -1637,8 +1820,15 @@ CanvasImageDataImpl *CanvasContext2DImpl::getImageData(float sx, float sy, float
 
 void CanvasContext2DImpl::putImageData(CanvasImageDataImpl *id, float dx, float dy, int &exceptionCode)
 {
+    exceptionCode = 0;
+
     if (!id) {
         exceptionCode = DOMException::TYPE_MISMATCH_ERR;
+        return;
+    }
+
+    if (anyNonFinite(dx, dy)) {
+        exceptionCode = DOMException::NOT_SUPPORTED_ERR;
         return;
     }
 
@@ -1649,18 +1839,32 @@ void CanvasContext2DImpl::putImageData(CanvasImageDataImpl *id, float dx, float 
     // Hence we need to mark ourselves dirty, too
     needRendererUpdate();
     QPainter p(canvasImage->qimage());
-    int x = qRound(dx);
-    int y = qRound(dy);
+    int x = safeRound(dx);
+    int y = safeRound(dy);
     p.setCompositionMode(QPainter::CompositionMode_Source);
     p.drawImage(x, y, id->data);
+    p.end();
 }
 
 CanvasImageDataImpl *CanvasContext2DImpl::createImageData(float sw, float sh, int &exceptionCode)
 {
-    int w = qRound(qAbs(sw));
-    int h = qRound(qAbs(sh));
+    exceptionCode = 0;
+
+    if (anyNonFinite(sw, sh)) {
+        exceptionCode = DOMException::NOT_SUPPORTED_ERR;
+        return nullptr;
+    }
+
+    int w = safeRound(qAbs(sw));
+    int h = safeRound(qAbs(sh));
 
     if (w == 0 || h == 0) {
+        exceptionCode = DOMException::INDEX_SIZE_ERR;
+        return nullptr;
+    }
+
+    // DoS protection: script could previously ask for a multi-gigabyte buffer.
+    if (!khtmlImLoad::ImageManager::isAcceptableSize(unsigned(w), unsigned(h))) {
         exceptionCode = DOMException::INDEX_SIZE_ERR;
         return nullptr;
     }
@@ -1671,3 +1875,4 @@ CanvasImageDataImpl *CanvasContext2DImpl::createImageData(float sw, float sh, in
     return id;
 }
 
+#undef MARK_CANVAS_UNSAFE
