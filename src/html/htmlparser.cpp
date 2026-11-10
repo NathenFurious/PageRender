@@ -84,6 +84,37 @@ static QString getParserPrintableName(int id)
 
 //----------------------------------------------------------------------------
 
+// Maximum depth of the open-element stack. Pathological input such as
+// "<div><div><div>..." (or <b><b><b>...) used to build trees hundreds of
+// thousands of levels deep, which blew the C++ stack in layout/painting/teardown
+// and made popBlock()/reopenResidualStyleTags() quadratic. Elements past this
+// depth are still inserted, but as leaves (their children become siblings).
+static const int kMaxNestingDepth = 512;
+
+// Elements whose content is not ordinary markup (raw text, script, widgets);
+// flattening these would spill their text content into the page.
+static bool mustKeepOpenWhenTooDeep(int id)
+{
+    switch (id) {
+    case ID_SCRIPT:
+    case ID_STYLE:
+    case ID_TITLE:
+    case ID_TEXTAREA:
+    case ID_PLAINTEXT:
+    case ID_XMP:
+    case ID_IFRAME:
+    case ID_NOEMBED:
+    case ID_NOFRAMES:
+    case ID_NOSCRIPT:
+    case ID_SELECT:
+    case ID_OBJECT:
+    case ID_APPLET:
+        return true;
+    default:
+        return false;
+    }
+}
+
 /**
  * @internal
  */
@@ -101,7 +132,8 @@ public:
         strayTableContent(false),
         m_inline(_inline_),
         node(_node),
-        next(_next)
+        next(_next),
+        depth(_next ? _next->depth + 1 : 1)
     {
         node->ref();
     }
@@ -124,6 +156,7 @@ public:
     bool m_inline;
     NodeImpl *node;
     HTMLStackElem *next;
+    int       depth; // number of entries on the stack up to and including this one
 };
 
 /**
@@ -162,6 +195,7 @@ KHTMLParser::KHTMLParser(KHTMLView *_parent, DocumentImpl *doc)
 
     blockStack = nullptr;
     current = nullptr;
+    isindex = nullptr; // reset() frees any pending <isindex>, so it must start out valid
 
     // ID_CLOSE_TAG == Num of tags
     forbiddenTag = new ushort[ID_CLOSE_TAG + 1];
@@ -178,6 +212,7 @@ KHTMLParser::KHTMLParser(DOM::DocumentFragmentImpl *i, DocumentImpl *doc)
 
     blockStack = nullptr;
     current = nullptr;
+    isindex = nullptr;
 
     reset();
 
@@ -223,7 +258,9 @@ void KHTMLParser::reset()
     form = nullptr;
     map = nullptr;
     end = false;
+    delete isindex;      // was leaked when a parser was reset with an <isindex> pending
     isindex = nullptr;
+    head = nullptr;      // don't keep a <head> from the previous document
 
     discard_until = 0;
 }
@@ -251,8 +288,7 @@ void KHTMLParser::parseToken(Token *t)
     qCDebug(KHTML_LOG) << "inline=" << m_inline << " inBody=" << inBody << " haveFrameSet=" << haveFrameSet << " haveContent=" << haveContent;
 #endif
 
-    // holy shit. apparently some sites use </br> instead of <br>
-    // be compatible with IE and NS
+    // Some sites use </br> instead of <br>; be compatible with IE and NS.
     if (t->tid == ID_BR + ID_CLOSE_TAG && document->inCompatMode()) {
         t->tid -= ID_CLOSE_TAG;
     }
@@ -326,7 +362,13 @@ void KHTMLParser::parseToken(Token *t)
 #endif
             form = nullptr;
         }
-        delete n;
+        if (head.get() == n) {
+            // 'head' holds the reference; dropping it destroys the node. A plain
+            // delete here used to leave 'head' dangling (use after free / double free).
+            head = nullptr;
+        } else {
+            delete n;
+        }
     }
 }
 
@@ -372,8 +414,10 @@ void KHTMLParser::parseDoctypeToken(DoctypeToken *t)
             QString lowerPubID = t->publicID.toLower();
             QByteArray pubIDStr = lowerPubID.toLocal8Bit();
 
-            // Look up the entry in our gperf-generated table.
-            const PubIDInfo *doctypeEntry = Perfect_Hash::findDoctypeEntry(pubIDStr.constData(), t->publicID.length());
+            // Look up the entry in our gperf-generated table. The length must be that of
+            // the *byte* buffer we hand over (it used to be the QString's UTF-16 length,
+            // which differs for non-ASCII IDs and could make the hash read out of bounds).
+            const PubIDInfo *doctypeEntry = Perfect_Hash::findDoctypeEntry(pubIDStr.constData(), pubIDStr.length());
             if (!doctypeEntry) {
                 // The DOCTYPE is not in the list.  Assume strict mode.
                 // ### Doesn't make any sense, but it's what Mozilla does.
@@ -392,7 +436,9 @@ void KHTMLParser::parseDoctypeToken(DoctypeToken *t)
                     htmldoc->changeModes(DOM::DocumentImpl::Transitional, DOM::DocumentImpl::Html4);
                     break;
                 default:
-                    assert(!"Unknown parse mode");
+                    // unknown mode flag: leave the document mode unchanged
+                    // (this used to be an assert, i.e. fell off the switch in release builds)
+                    break;
                 }
             }
         }
@@ -411,6 +457,14 @@ static bool isTableRelatedTag(int id)
 bool KHTMLParser::insertNode(NodeImpl *n, bool flat)
 {
     int id = n->id();
+
+    // Inserts a parser-synthesised element (implied <tbody>, <body>, <li>, ...).
+    // If the DOM refuses it we still own it, so free it instead of leaking it.
+    auto insertImplied = [this](NodeImpl *implied) {
+        if (!insertNode(implied)) {
+            delete implied;
+        }
+    };
 
     // <table> is never allowed inside stray table content.  Always pop out of the stray table content
     // and close up the first table, and then start the second table as a sibling.
@@ -434,8 +488,12 @@ bool KHTMLParser::insertNode(NodeImpl *n, bool flat)
             static_cast<HTMLFormElementImpl *>(n)->setMalformed(true);
         }
 
+        // Too deep? Keep the element but don't descend into it (see kMaxNestingDepth).
+        const bool tooDeep = blockStack && blockStack->depth >= kMaxNestingDepth &&
+                             n->isElementNode() && !mustKeepOpenWhenTooDeep(id);
+
         // don't push elements without end tag on the stack
-        if (tagPriority(id) != 0 && !flat) {
+        if (tagPriority(id) != 0 && !flat && !tooDeep) {
 #if SPEED_DEBUG < 2
             if (!n->attached() && HTMLWidget) {
                 n->attach();
@@ -515,6 +573,7 @@ bool KHTMLParser::insertNode(NodeImpl *n, bool flat)
             if (head) {
                 break;
             }
+        // fall through
         case ID_META:
         case ID_LINK:
         case ID_ISINDEX:
@@ -523,13 +582,16 @@ bool KHTMLParser::insertNode(NodeImpl *n, bool flat)
                 createHead();
             }
             if (head) {
-                if (head->addChild(n)) {
-#if SPEED_DEBUG < 2
-                    if (!n->attached() && HTMLWidget) {
-                        n->attach();
-                    }
-#endif
+                // Report failure to the caller (who then frees n) instead of claiming
+                // success for a node that never made it into the tree.
+                if (!head->addChild(n)) {
+                    return false;
                 }
+#if SPEED_DEBUG < 2
+                if (!n->attached() && HTMLWidget) {
+                    n->attach();
+                }
+#endif
 
                 return true;
             }
@@ -537,17 +599,21 @@ bool KHTMLParser::insertNode(NodeImpl *n, bool flat)
             break;
         case ID_HTML:
             if (!current->isDocumentNode()) {
-                if (doc()->documentElement()->id() == ID_HTML) {
+                if (doc()->documentElement() && doc()->documentElement()->id() == ID_HTML) {
                     // we have another <HTML> element.... apply attributes to existing one
                     // make sure we don't overwrite already existing attributes
-                    NamedAttrMapImpl *map = static_cast<ElementImpl *>(n)->attributes(true);
+                    NamedAttrMapImpl *srcAttrs = static_cast<ElementImpl *>(n)->attributes(true);
                     NamedAttrMapImpl *bmap = static_cast<ElementImpl *>(doc()->documentElement())->attributes(false);
                     bool changed = false;
-                    for (unsigned long l = 0; map && l < map->length(); ++l) {
-                        NodeImpl::Id attrId = map->idAt(l);
-                        DOMStringImpl *attrValue = map->valueAt(l);
-                        changed = !bmap->getValue(attrId);
-                        bmap->setValue(attrId, attrValue);
+                    for (unsigned long l = 0; srcAttrs && l < srcAttrs->length(); ++l) {
+                        NodeImpl::Id attrId = srcAttrs->idAt(l);
+                        DOMStringImpl *attrValue = srcAttrs->valueAt(l);
+                        // (this used to overwrite existing attributes and to reset 'changed'
+                        //  on every iteration; now identical to the <body> merge below)
+                        if (!bmap->getValue(attrId)) {
+                            bmap->setValue(attrId, attrValue);
+                            changed = true;
+                        }
                     }
                     if (changed) {
                         doc()->recalcStyle(NodeImpl::Inherit);
@@ -562,10 +628,10 @@ bool KHTMLParser::insertNode(NodeImpl *n, bool flat)
                 createHead();
             }
             if (head) {
-                DOM::NodeImpl *newNode = head->addChild(n);
-                if (newNode) {
+                DOM::NodeImpl *headChild = head->addChild(n);
+                if (headChild) {
                     pushBlock(id, tagPriority(id));
-                    setCurrent(newNode);
+                    setCurrent(headChild);
 #if SPEED_DEBUG < 2
                     if (!n->attached() && HTMLWidget) {
                         n->attach();
@@ -575,7 +641,8 @@ bool KHTMLParser::insertNode(NodeImpl *n, bool flat)
 #ifdef PARSER_DEBUG
                     qCDebug(KHTML_LOG) << "adding style before to body failed!!!!";
 #endif
-                    discard_until = ID_STYLE + ID_CLOSE_TAG;
+                    // was ID_STYLE for both: a rejected <title> swallowed everything up to </style>
+                    discard_until = id + ID_CLOSE_TAG;
                     return false;
                 }
                 return true;
@@ -593,12 +660,12 @@ bool KHTMLParser::insertNode(NodeImpl *n, bool flat)
                 // we have another <BODY> element.... apply attributes to existing one
                 // make sure we don't overwrite already existing attributes
                 // some sites use <body bgcolor=rightcolor>...<body bgcolor=wrongcolor>
-                NamedAttrMapImpl *map = static_cast<ElementImpl *>(n)->attributes(true);
+                NamedAttrMapImpl *srcAttrs = static_cast<ElementImpl *>(n)->attributes(true);
                 NamedAttrMapImpl *bmap = doc()->body()->attributes(false);
                 bool changed = false;
-                for (unsigned long l = 0; map && l < map->length(); ++l) {
-                    NodeImpl::Id attrId = map->idAt(l);
-                    DOMStringImpl *attrValue = map->valueAt(l);
+                for (unsigned long l = 0; srcAttrs && l < srcAttrs->length(); ++l) {
+                    NodeImpl::Id attrId = srcAttrs->idAt(l);
+                    DOMStringImpl *attrValue = srcAttrs->valueAt(l);
                     if (!bmap->getValue(attrId)) {
                         bmap->setValue(attrId, attrValue);
                         changed = true;
@@ -617,14 +684,15 @@ bool KHTMLParser::insertNode(NodeImpl *n, bool flat)
         // outside of tables.
         // needed for broken constructs like <table><form ...><tr>....
         case ID_INPUT: {
-            ElementImpl *e = static_cast<ElementImpl *>(n);
-            DOMString type = e->getAttribute(ATTR_TYPE);
+            ElementImpl *inputEl = static_cast<ElementImpl *>(n);
+            DOMString type = inputEl->getAttribute(ATTR_TYPE);
 
             if (strcasecmp(type, "hidden") != 0) {
                 break;
             }
             // Fall through!
         }
+        // fall through
         case ID_TEXT: {
             // Don't try to fit random white-space anywhere
             TextImpl *t = static_cast<TextImpl *>(n);
@@ -645,20 +713,23 @@ bool KHTMLParser::insertNode(NodeImpl *n, bool flat)
             popBlock(ID_DT);
             if (current->id() == ID_DL) {
                 e = new HTMLGenericElementImpl(document, ID_DD);
-                insertNode(e);
+                insertImplied(e);
                 handled = true;
             }
             break;
         case ID_DT:
             e = new HTMLDListElementImpl(document);
             if (insertNode(e)) {
-                insertNode(n);
-                return true;
+                return insertNode(n);
             }
+            delete e; // wrapper was refused; it used to leak
             break;
         case ID_AREA: {
             if (map) {
-                map->addChild(n);
+                // report failure instead of claiming success for a node that wasn't added
+                if (!map->addChild(n)) {
+                    return false;
+                }
 #if SPEED_DEBUG < 2
                 if (!n->attached() && HTMLWidget) {
                     n->attach();
@@ -683,6 +754,7 @@ bool KHTMLParser::insertNode(NodeImpl *n, bool flat)
                 return insertNode(n);
             }
         }
+        // fall through
         default:
             break;
         }
@@ -702,8 +774,13 @@ bool KHTMLParser::insertNode(NodeImpl *n, bool flat)
             case ID_BASE:
                 if (!head) {
                     head = new HTMLHeadElementImpl(document);
-                    insertNode(head.get());
-                    handled = true;
+                    if (insertNode(head.get())) {
+                        handled = true;
+                    } else {
+                        // never made it into the tree: let go of it so createHead()
+                        // can try again later (and so we can't loop on it here)
+                        head = nullptr;
+                    }
                 }
                 break;
             case ID_TEXT: {
@@ -713,13 +790,14 @@ bool KHTMLParser::insertNode(NodeImpl *n, bool flat)
                 }
                 /* Fall through to default */
             }
+            // fall through
             default:
                 if (haveFrameSet) {
                     break;
                 }
                 e = new HTMLBodyElementImpl(document);
                 startBody();
-                insertNode(e);
+                insertImplied(e);
                 handled = true;
                 break;
             }
@@ -736,7 +814,7 @@ bool KHTMLParser::insertNode(NodeImpl *n, bool flat)
                 popBlock(ID_HEAD);
                 e = new HTMLBodyElementImpl(document);
                 startBody();
-                insertNode(e);
+                insertImplied(e);
                 handled = true;
             }
             break;
@@ -780,20 +858,23 @@ bool KHTMLParser::insertNode(NodeImpl *n, bool flat)
                         (node->id() == ID_TR &&
                          (parent->id() == ID_THEAD ||
                           parent->id() == ID_TBODY ||
-                          parent->id() == ID_TFOOT) && parentparent->id() == ID_TABLE) ||
+                          parent->id() == ID_TFOOT) && parentparent && parentparent->id() == ID_TABLE) ||
                         (!checkChild(ID_TR, id) && (node->id() == ID_THEAD || node->id() == ID_TBODY || node->id() == ID_TFOOT) &&
                          parent->id() == ID_TABLE)) {
                     node = (node->id() == ID_TABLE) ? node :
                            ((node->id() == ID_TR) ? parentparent : parent);
-                    NodeImpl *parent = node->parentNode();
-                    if (!parent) {
+                    if (!node) {
+                        return false;
+                    }
+                    NodeImpl *tableParent = node->parentNode();
+                    if (!tableParent) {
                         return false;
                     }
                     int exceptioncode = 0;
 #ifdef PARSER_DEBUG
                     qCDebug(KHTML_LOG) << "calling insertBefore(" << n->nodeName().string() << "," << node->nodeName().string() << ")";
 #endif
-                    parent->insertBefore(n, node, exceptioncode);
+                    tableParent->insertBefore(n, node, exceptioncode);
                     if (exceptioncode) {
 #ifndef PARSER_DEBUG
                         if (!n->isTextNode())
@@ -820,7 +901,7 @@ bool KHTMLParser::insertNode(NodeImpl *n, bool flat)
                     e = new HTMLTableRowElementImpl(document);
                 }
 
-                insertNode(e);
+                insertImplied(e);
                 handled = true;
                 break;
             } // end default
@@ -835,7 +916,7 @@ bool KHTMLParser::insertNode(NodeImpl *n, bool flat)
         case ID_MENU:
             e = new HTMLLIElementImpl(document);
             e->addCSSProperty(CSS_PROP_LIST_STYLE_TYPE, CSS_VAL_NONE);
-            insertNode(e);
+            insertImplied(e);
             handled = true;
             break;
         case ID_FORM:
@@ -880,10 +961,10 @@ bool KHTMLParser::insertNode(NodeImpl *n, bool flat)
             break;
         default:
             if (current->isDocumentNode()) {
-                DocumentImpl *doc = static_cast<DocumentImpl *>(current);
-                if (!doc->documentElement()) {
+                DocumentImpl *currentDoc = static_cast<DocumentImpl *>(current);
+                if (!currentDoc->documentElement()) {
                     e = new HTMLHtmlElementImpl(document);
-                    insertNode(e);
+                    insertImplied(e);
                     handled = true;
                 }
             } else if (current->isInline()) {
@@ -962,9 +1043,10 @@ NodeImpl *KHTMLParser::getElement(Token *t)
             // we can't implement that behavior now because it could cause too many
             // regressions and the headaches are not worth the work as long as there is
             // no site actually relying on that detail (Dirk)
-            if (static_cast<HTMLDocumentImpl *>(document)->body())
-                static_cast<HTMLDocumentImpl *>(document)->body()
-                ->addCSSProperty(CSS_PROP_DISPLAY, CSS_VAL_NONE);
+            HTMLElementImpl *const oldBody = static_cast<HTMLDocumentImpl *>(document)->body();
+            if (oldBody) {
+                oldBody->addCSSProperty(CSS_PROP_DISPLAY, CSS_VAL_NONE);
+            }
             inBody = false;
         }
         if ((haveBody || haveContent || haveFrameSet) && current->id() == ID_HTML) {
@@ -1008,15 +1090,15 @@ NodeImpl *KHTMLParser::getElement(Token *t)
     case ID_ISINDEX:
         n = handleIsindex(t);
         if (!inBody) {
+            delete isindex; // a second pre-body <isindex> used to leak the first
             isindex = n;
             n = nullptr;
         } else {
             t->flat = true;
         }
         break;
-    case ID_KEYGEN:
-        n = new HTMLKeygenElementImpl(document, form);
-        break;
+    // (ID_KEYGEN is gone: <keygen> was removed from the web platform and its element
+    //  class has been deleted; it now becomes an ordinary unknown element.)
     case ID_LABEL:
         n = new HTMLLabelElementImpl(document);
         break;
@@ -1255,6 +1337,7 @@ NodeImpl *KHTMLParser::getElement(Token *t)
         if (t->tid == ID_NOBR || t->tid == ID_WBR) {
             popOptionalBlock(t->tid);
         }
+    // fall through
     case ID_BDO:
         n = new HTMLGenericElementImpl(document, t->tid);
         break;
@@ -1382,31 +1465,33 @@ void KHTMLParser::processCloseTag(Token *t)
             return;
         }
         break;
-    case ID_H1:
-    case ID_H2:
-    case ID_H3:
-    case ID_H4:
-    case ID_H5:
-    case ID_H6:
+    // These used to be written as ID_H1..ID_H6 (the *open* tag ids), so the
+    // heading-scope check below never ran for </h1>..</h6>.
+    case ID_H1+ID_CLOSE_TAG:
+    case ID_H2+ID_CLOSE_TAG:
+    case ID_H3+ID_CLOSE_TAG:
+    case ID_H4+ID_CLOSE_TAG:
+    case ID_H5+ID_CLOSE_TAG:
+    case ID_H6+ID_CLOSE_TAG:
         if (!isHeadingInScope()) {
             // Parse error. Ignore token.
             return;
         }
         break;
-    case ID_A: // Formatting elements - will need special handling - cf. HTML5 "adoption agency algorithm"
-    case ID_B: //                       meant to replace the "residual style" handling we have now.
-    case ID_BIG:
-    case ID_CODE:
-    case ID_EM:
-    case ID_FONT:
-    case ID_I:
-    case ID_NOBR:
-    case ID_S:
-    case ID_SMALL:
-    case ID_STRIKE:
-    case ID_STRONG:
-    case ID_TT:
-    case ID_U:
+    case ID_A+ID_CLOSE_TAG: // Formatting elements - will need special handling - cf. HTML5 "adoption agency algorithm"
+    case ID_B+ID_CLOSE_TAG: //                       meant to replace the "residual style" handling we have now.
+    case ID_BIG+ID_CLOSE_TAG:
+    case ID_CODE+ID_CLOSE_TAG:
+    case ID_EM+ID_CLOSE_TAG:
+    case ID_FONT+ID_CLOSE_TAG:
+    case ID_I+ID_CLOSE_TAG:
+    case ID_NOBR+ID_CLOSE_TAG:
+    case ID_S+ID_CLOSE_TAG:
+    case ID_SMALL+ID_CLOSE_TAG:
+    case ID_STRIKE+ID_CLOSE_TAG:
+    case ID_STRONG+ID_CLOSE_TAG:
+    case ID_TT+ID_CLOSE_TAG:
+    case ID_U+ID_CLOSE_TAG:
         break;
 
     default:
@@ -1567,7 +1652,8 @@ void KHTMLParser::handleResidualStyleCloseTagAcrossBlocks(HTMLStackElem *elem)
         RefPtr<NodeImpl> prevNode = nullptr;
         RefPtr<NodeImpl> currNode = nullptr;
         currElem = maxElem;
-        while (currElem->node != residualElem) {
+        // (null-checked: walking off the end of the stack used to be a null dereference)
+        while (currElem && currElem->node != residualElem) {
             if (isResidualStyleTag(currElem->node->id())) {
                 // Create a clone of this element.
                 currNode = currElem->node->cloneNode(false);
@@ -1614,20 +1700,24 @@ void KHTMLParser::handleResidualStyleCloseTagAcrossBlocks(HTMLStackElem *elem)
         // Step 3: Place |blockElem|'s children under |newNode|.  Remove all of the children of |blockElem|
         // before we've put |newElem| into the document.  That way we'll only do one attachment of all
         // the new content (instead of a bunch of individual attachments).
-        NodeImpl *currNode = blockElem->firstChild();
-        while (currNode) {
-            NodeImpl *nextNode = currNode->nextSibling();
-            SharedPtr<NodeImpl> guard(currNode); //Protect from deletion while moving
-            blockElem->removeChild(currNode, exceptionCode);
-            newNode->appendChild(currNode, exceptionCode);
-            currNode = nextNode;
+        NodeImpl *childNode = blockElem->firstChild();
+        while (childNode) {
+            NodeImpl *nextNode = childNode->nextSibling();
+            SharedPtr<NodeImpl> childGuard(childNode); //Protect from deletion while moving
+            blockElem->removeChild(childNode, exceptionCode);
+            newNode->appendChild(childNode, exceptionCode);
 
 // TODO - To be replaced.
-            // Re-register form elements with currently active form, step 1 will have removed them
-            if (form && currNode && currNode->isGenericFormElement()) {
-                HTMLGenericFormElementImpl *e = static_cast<HTMLGenericFormElementImpl *>(currNode);
-                form->registerFormElement(e);
+            // Re-register form elements with currently active form, step 1 will have removed them.
+            // (This used to test and register the *next* sibling instead of the node that was
+            //  just moved, so the first form control was never re-registered and a later one
+            //  got registered ahead of its turn.)
+            if (form && childNode->isGenericFormElement()) {
+                HTMLGenericFormElementImpl *fe = static_cast<HTMLGenericFormElementImpl *>(childNode);
+                form->registerFormElement(fe);
             }
+
+            childNode = nextNode;
         }
 
         // Step 4: Place |newNode| under |blockElem|.  |blockElem| is still out of the document, so no
@@ -1780,7 +1870,7 @@ bool KHTMLParser::isElementInScope(int _id)
         }
         Elem = Elem->next;
     }
-    return Elem;
+    return Elem != nullptr;
 }
 
 bool KHTMLParser::isHeadingInScope()
@@ -1792,7 +1882,7 @@ bool KHTMLParser::isHeadingInScope()
         }
         Elem = Elem->next;
     }
-    return Elem;
+    return Elem != nullptr;
 }
 
 void KHTMLParser::popBlock(int _id)
@@ -1953,7 +2043,8 @@ void KHTMLParser::createHead()
 #ifdef PARSER_DEBUG
         qCDebug(KHTML_LOG) << "creation of head failed!!!!:" << exceptioncode;
 #endif
-        delete head.get();
+        // 'head' holds the only reference. The old "delete head.get(); head = nullptr;"
+        // freed the node and then released a reference on the freed memory (double free).
         head = nullptr;
     }
 
@@ -2001,7 +2092,9 @@ void KHTMLParser::startBody()
     inBody = true;
 
     if (isindex) {
-        insertNode(isindex, true /* don't decend into this node */);
+        if (!insertNode(isindex, true /* don't descend into this node */)) {
+            delete isindex; // refused by the DOM; it used to leak
+        }
         isindex = nullptr;
     }
 }
