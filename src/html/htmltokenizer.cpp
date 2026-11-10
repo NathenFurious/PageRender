@@ -28,6 +28,36 @@
 //----------------------------------------------------------------------------
 //
 // KDE HTML Widget - Tokenizers
+//
+// Hardening / cleanup pass. Summary of changes relative to the previous version
+// (no header changes are required):
+//
+//  * Memory safety
+//      - raw-content buffer is guaranteed room for a full entity expansion before
+//        parseEntity() writes into it (previously could overflow by up to 10 QChars
+//        for unknown entities inside <textarea>/<title>)
+//      - entities split across write() chunks inside <textarea>/<title> are now
+//        resumed against the raw-content buffer rather than the token buffer
+//      - buffer growth is overflow-checked and allocation failures are no longer
+//        dereferenced
+//  * Correctness
+//      - numeric character references no longer overflow (hex used a signed int
+//        with up to 8 digits) and out-of-range / surrogate code points become U+FFFD
+//      - '[' directly after PUBLIC/SYSTEM keyword fragments in a doctype no longer
+//        silently overrides the "bogus doctype" state
+//      - tokens for unknown tag names no longer leak their attributes into the next
+//        token
+//      - state that was left uninitialised (entity / search state) is now reset
+//        in begin() and reset()
+//      - tag names are lower-cased with a real A-Z check instead of "| 0x20"
+//  * Performance
+//      - no temporary QString objects are created per character in the raw-content
+//        scanner (comment start and end-tag detection are done in place)
+//      - Windows-1252 fix-up is a table lookup with a one-compare fast path
+//        instead of a 28-way switch executed for every text character
+//  * Maintainability
+//      - the fix-up macro is a type-checked inline function
+//      - dead code / stale debug statements removed
 
 // #define TOKEN_DEBUG 1
 // #define TOKEN_DEBUG 2
@@ -46,6 +76,7 @@
 #include <kcharsets.h>
 #include <ctype.h>
 #include <assert.h>
+#include <limits.h>
 #include <QVariant>
 #include "khtml_debug.h"
 #include <stdlib.h>
@@ -78,8 +109,25 @@ static const int sTokenizerFastYieldDelay = 180;
 static const int sTokenizerYieldDelay = 450;
 #endif
 
-#define KHTML_ALLOC_QCHAR_VEC( N ) (QChar*) malloc( sizeof(QChar)*( N ) )
-#define KHTML_REALLOC_QCHAR_VEC(P, N ) (QChar*) realloc(P, sizeof(QChar)*( N ))
+// Upper bound (in QChars) for the token / raw content buffers. Anything beyond
+// this is almost certainly a hostile or corrupt document and growing further
+// would risk integer overflow in the size arithmetic.
+static const int sMaxBufferChars = INT_MAX / int(sizeof(QChar)) / 2;
+
+static QChar *khtmlReallocQCharVec(QChar *p, int n)
+{
+    if (n <= 0 || n > sMaxBufferChars) {
+        qFatal("HTMLTokenizer: refusing to allocate %d QChars", n);
+    }
+    QChar *np = static_cast<QChar *>(realloc(p, sizeof(QChar) * size_t(n)));
+    if (!np) {
+        qFatal("HTMLTokenizer: out of memory allocating %d QChars", n);
+    }
+    return np;
+}
+
+#define KHTML_ALLOC_QCHAR_VEC( N ) khtmlReallocQCharVec(nullptr, ( N ))
+#define KHTML_REALLOC_QCHAR_VEC(P, N ) khtmlReallocQCharVec(( P ), ( N ))
 #define KHTML_DELETE_QCHAR_VEC( P ) free((char*)( P ))
 
 // Full support for MS Windows extensions to Latin-1.
@@ -93,43 +141,40 @@ static const int sTokenizerYieldDelay = 450;
 //      http://www.bbsinc.com/iso8859.html
 //      http://www.obviously.com/
 //
-// There may be better equivalents
-#if 0
-#define fixUpChar(x)
-#else
-#define fixUpChar(x) \
-    switch ((x).unicode()) \
-    { \
-    case 0x80: (x) = 0x20ac; break; \
-    case 0x82: (x) = 0x201a;    break; \
-    case 0x83: (x) = 0x0192; break; \
-    case 0x84: (x) = 0x201e;    break; \
-    case 0x85: (x) = 0x2026; break; \
-    case 0x86: (x) = 0x2020; break; \
-    case 0x87: (x) = 0x2021; break; \
-    case 0x88: (x) = 0x02C6; break; \
-    case 0x89: (x) = 0x2030; break; \
-    case 0x8A: (x) = 0x0160; break; \
-    case 0x8b: (x) = 0x2039;    break; \
-    case 0x8C: (x) = 0x0152; break; \
-    case 0x8E: (x) = 0x017D; break; \
-    case 0x91: (x) = 0x2018;   break; \
-    case 0x92: (x) = 0x2019;   break; \
-    case 0x93: (x) = 0x201C;    break; \
-    case 0x94: (x) = 0X201D;    break; \
-    case 0x95: (x) = 0x2022;    break; \
-    case 0x96: (x) = 0x2013;    break; \
-    case 0x97: (x) = 0x2014;    break; \
-    case 0x98: (x) = 0x02DC;    break; \
-    case 0x99: (x) = 0x2122; break; \
-    case 0x9A: (x) = 0x0161; break; \
-    case 0x9b: (x) = 0x203A;    break; \
-    case 0x9C: (x) = 0x0153; break; \
-    case 0x9E: (x) = 0x017E; break; \
-    case 0x9F: (x) = 0x0178; break; \
-    default: break; \
+// Maps U+0080..U+009F to what Windows-1252 puts there. Unassigned slots map to
+// themselves.
+static const ushort sWin1252Fixup[32] = {
+    0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, // 80-87
+    0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008D, 0x017D, 0x008F, // 88-8F
+    0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014, // 90-97
+    0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178  // 98-9F
+};
+
+static inline QChar fixUpChar(QChar c)
+{
+    const ushort u = c.unicode();
+    if (u - 0x80u < 0x20u) {
+        return QChar(sWin1252Fixup[u - 0x80u]);
     }
-#endif
+    return c;
+}
+
+// Compares n QChars against an all-lowercase ASCII literal, ignoring ASCII case.
+// No allocations, unlike QString::fromRawData + QString::compare.
+static inline bool matchesAsciiNoCase(const QChar *s, const char *lit, int n)
+{
+    for (int i = 0; i < n; ++i) {
+        ushort c = s[i].unicode();
+        if (c >= 'A' && c <= 'Z') {
+            c |= 0x20;
+        }
+        if (c != static_cast<uchar>(lit[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // ----------------------------------------------------------------------------
 
 HTMLTokenizer::HTMLTokenizer(DOM::DocumentImpl *_doc, KHTMLView *_view)
@@ -197,7 +242,7 @@ void HTMLTokenizer::reset()
         KHTML_DELETE_QCHAR_VEC(rawContent);
     }
     rawContent = nullptr;
-    rawContentSize = rawContentMaxSize = rawContentResync = 0;
+    rawContentSize = rawContentMaxSize = rawContentResync = rawContentSinceLastEntity = 0;
 
     if (m_yieldTimer > 0) {
         killTimer(m_yieldTimer);
@@ -247,6 +292,11 @@ void HTMLTokenizer::begin()
     doctypeSearchCount = 0;
     doctypeSecondarySearchCount = 0;
     Entity = NoEntity;
+    EntityChar = QChar::Null;
+    entityLen = 0;
+    cBufferPos = 0;
+    searchStopper = nullptr;
+    searchStopperLen = 0;
     noMoreData = false;
     brokenComments = false;
     brokenServer = false;
@@ -360,7 +410,9 @@ void HTMLTokenizer::parseRawContent(TokenizerString &src)
         unsigned char ch = src->toLatin1();
         if (!rawContentResync && !brokenComments && !xmp && ch == '-' &&
                 rawContentSize >= 3 && ((!textarea && !title) || rawContentSinceLastEntity >= 3) && !src.escaped() &&
-                QString::fromRawData(rawContent + rawContentSize - 3, 3) == "<!-") {
+                rawContent[rawContentSize - 3] == QLatin1Char('<') &&
+                rawContent[rawContentSize - 2] == QLatin1Char('!') &&
+                rawContent[rawContentSize - 1] == QLatin1Char('-')) {
             comment = true;
             rawContent[ rawContentSize++ ] = ch;
             ++src;
@@ -396,8 +448,7 @@ void HTMLTokenizer::parseRawContent(TokenizerString &src)
         // possible end of tagname, lets check.
         if (!rawContentResync && !escaped && !src.escaped() && (ch == '>' || ch == '/' || ch <= ' ') && ch &&
                 rawContentSize >= searchStopperLen && ((!textarea && !title) || rawContentSinceLastEntity >= searchStopperLen) &&
-                QString::compare(QString::fromRawData(rawContent + rawContentSize - searchStopperLen, searchStopperLen),
-                                 QLatin1String(searchStopper), Qt::CaseInsensitive) == 0) {
+                matchesAsciiNoCase(rawContent + rawContentSize - searchStopperLen, searchStopper, searchStopperLen)) {
 
             // the purpose of rawContentResync is to look for an end tag that could possibly be of the form:
             // </endtag   junk="more junk>\"><>"     >
@@ -418,6 +469,10 @@ void HTMLTokenizer::parseRawContent(TokenizerString &src)
         }
         escaped = (!escaped && ch == '\\');
         if (!rawContentResync && (textarea || title) && !src.escaped() && ch == '&') {
+            // parseEntity() may append up to '&' + 9 characters when the entity is
+            // unknown, so make sure there is room *before* taking the write pointer
+            // (the buffer may move).
+            checkRawContentBuffer(16);
             QChar *rawContentDest = rawContent + rawContentSize;
             ++src;
             parseEntity(src, rawContentDest, true);
@@ -645,9 +700,6 @@ void HTMLTokenizer::parseDoctype(TokenizerString &src)
         switch (doctypeToken.state) {
         case DoctypeBegin: {
             doctypeToken.state = DoctypeBeforeName;
-            if (isWhitespace) {
-                // nothing
-            }
             break;
         }
         case DoctypeBeforeName: {
@@ -682,19 +734,22 @@ void HTMLTokenizer::parseDoctype(TokenizerString &src)
                 doctype = false;
                 processDoctypeToken();
             } else if (c == '[') {
-                if (doctypeSearchCount > 0 || doctypeSecondarySearchCount > 0) { // is there any public/system indicator before?
+                if (doctypeSearchCount > 0 || doctypeSecondarySearchCount > 0) {
+                    // A partial PUBLIC/SYSTEM keyword precedes the subset: the
+                    // doctype is malformed. (The previous code set this state and
+                    // then immediately overwrote it below.)
                     doctypeSearchCount = doctypeSecondarySearchCount = 0;
                     doctypeToken.state = DoctypeBogus;
+                } else {
+                    // Found internal subset
+                    doctypeToken.state = DoctypeInternalSubset;
+                    doctypeAllowComment = false;
                 }
-                // Found internal subset
-                doctypeToken.state = DoctypeInternalSubset;
-                doctypeAllowComment = false;
             } else if (!isWhitespace) {
                 if (c.toLower() == publicStart[doctypeSearchCount]) {
                     doctypeSearchCount++;
-                    if (doctypeSearchCount == 6)
+                    if (doctypeSearchCount == 6) {
                         // Found 'PUBLIC' sequence
-                    {
                         doctypeToken.state = DoctypeBeforePublicID;
                     }
                 } else if (doctypeSearchCount > 0) {
@@ -702,9 +757,8 @@ void HTMLTokenizer::parseDoctype(TokenizerString &src)
                     doctypeToken.state = DoctypeBogus;
                 } else if (c.toLower() == systemStart[doctypeSecondarySearchCount]) {
                     doctypeSecondarySearchCount++;
-                    if (doctypeSecondarySearchCount == 6)
+                    if (doctypeSecondarySearchCount == 6) {
                         // Found 'SYSTEM' sequence
-                    {
                         doctypeToken.state = DoctypeBeforeSystemID;
                     }
                 } else {
@@ -926,6 +980,7 @@ void HTMLTokenizer::parseEntity(TokenizerString &src, QChar *&dest, bool start)
         cBufferPos = 0;
         entityLen = 0;
         Entity = SearchEntity;
+        EntityChar = QChar::Null;
     }
 
     while (!src.isEmpty()) {
@@ -934,7 +989,6 @@ void HTMLTokenizer::parseEntity(TokenizerString &src, QChar *&dest, bool start)
         case NoEntity:
             return;
 
-            break;
         case SearchEntity:
             if (cc == '#') {
                 cBuffer[cBufferPos++] = cc;
@@ -960,7 +1014,10 @@ void HTMLTokenizer::parseEntity(TokenizerString &src, QChar *&dest, bool start)
             break;
 
         case Hexadecimal: {
-            int uc = EntityChar.unicode();
+            // The value is saturated at 0xFFFF (stored in EntityChar, which survives
+            // chunk boundaries) so that long digit runs cannot overflow. A saturated
+            // result is turned into U+FFFD in SearchSemicolon.
+            uint uc = EntityChar.unicode();
             int ll = qMin<uint>(src.length(), 8);
             while (ll--) {
                 QChar csrc(src->toLower());
@@ -970,15 +1027,18 @@ void HTMLTokenizer::parseEntity(TokenizerString &src, QChar *&dest, bool start)
                     break;
                 }
                 uc = uc * 16 + (cc - (cc < 'a' ? '0' : 'a' - 10));
+                if (uc > 0xFFFF) {
+                    uc = 0xFFFF;
+                }
                 cBuffer[cBufferPos++] = cc;
                 ++src;
             }
-            EntityChar = QChar(uc);
+            EntityChar = QChar(ushort(uc));
             Entity = SearchSemicolon;
             break;
         }
         case Decimal: {
-            int uc = EntityChar.unicode();
+            uint uc = EntityChar.unicode();
             int ll = qMin(src.length(), 9 - cBufferPos);
             while (ll--) {
                 cc = src->cell();
@@ -989,10 +1049,13 @@ void HTMLTokenizer::parseEntity(TokenizerString &src, QChar *&dest, bool start)
                 }
 
                 uc = uc * 10 + (cc - '0');
+                if (uc > 0xFFFF) {
+                    uc = 0xFFFF;
+                }
                 cBuffer[cBufferPos++] = cc;
                 ++src;
             }
-            EntityChar = QChar(uc);
+            EntityChar = QChar(ushort(uc));
             if (cBufferPos == 9) {
                 Entity = SearchSemicolon;
             }
@@ -1045,7 +1108,15 @@ void HTMLTokenizer::parseEntity(TokenizerString &src, QChar *&dest, bool start)
 #ifdef TOKEN_DEBUG
             qCDebug(KHTML_LOG) << "ENTITY " << EntityChar.unicode();
 #endif
-            fixUpChar(EntityChar);
+            // Numeric references: saturated values (anything above U+FFFF, which
+            // a single QChar cannot represent) and lone surrogates are invalid.
+            if (cBufferPos > 0 && cBuffer[0] == '#' && !EntityChar.isNull()) {
+                const ushort u = EntityChar.unicode();
+                if (u == 0xFFFF || (u >= 0xD800 && u <= 0xDFFF)) {
+                    EntityChar = QChar(0xFFFD);
+                }
+            }
+            EntityChar = fixUpChar(EntityChar);
 
             if (*src == ';') {
                 ++src;
@@ -1165,11 +1236,10 @@ void HTMLTokenizer::parseTag(TokenizerString &src)
                     finish = true;
                     break;
                 }
-                // this is a nasty performance trick. will work for the A-Z
-                // characters, but not for others. if it contains one,
-                // we fail anyway
-                char cc = curchar;
-                cBuffer[cBufferPos++] = cc | 0x20;
+                // ASCII lower-casing. Characters outside A-Z are stored unchanged
+                // (truncated to 8 bit, as before); they never match a known tag.
+                cBuffer[cBufferPos++] = (curchar >= 'A' && curchar <= 'Z')
+                                        ? char(curchar | 0x20) : char(curchar);
                 ++src;
             }
 
@@ -1200,22 +1270,21 @@ void HTMLTokenizer::parseTag(TokenizerString &src)
                 }
 
                 uint tagID = 0;
-                if (!tagID) {
-                    DOMString tagName(ptr);
-                    if (Element::khtmlValidQualifiedName(tagName)) {
-                        safeLocalName = LocalName::fromString(tagName, IDS_NormalizeLower);
-                        tagID = safeLocalName.id();
-                    }
+                DOMString tagName(ptr);
+                if (Element::khtmlValidQualifiedName(tagName)) {
+                    safeLocalName = LocalName::fromString(tagName, IDS_NormalizeLower);
+                    tagID = safeLocalName.id();
+                }
 #ifdef TOKEN_DEBUG
+                if (!tagID) {
                     QByteArray tmp(ptr, len + 1);
                     qCDebug(KHTML_LOG) << "Unknown tag: \"" << tmp.data() << "\"";
-#endif
-                }
-                if (tagID) {
-#ifdef TOKEN_DEBUG
+                } else {
                     QByteArray tmp(ptr, len + 1);
                     qCDebug(KHTML_LOG) << "found tag id=" << tagID << ": " << tmp.data();
+                }
 #endif
+                if (tagID) {
                     currToken.tid = beginTag ? tagID : tagID + ID_CLOSE_TAG;
                 }
                 dest = buffer;
@@ -1465,6 +1534,10 @@ void HTMLTokenizer::parseTag(TokenizerString &src)
             }
 
             if (!currToken.tid) { //stop if tag is unknown
+                // Drop whatever attributes/flags were collected for the unknown tag so
+                // they cannot be glued onto the next token.
+                currToken.reset();
+                dest = buffer;
                 return;
             }
 
@@ -1705,7 +1778,16 @@ void HTMLTokenizer::write(const TokenizerString &str, bool appendData)
             skipLF = false;
             ++src;
         } else if (Entity) {
-            parseEntity(src, dest);
+            if (textarea || title) {
+                // An entity that was interrupted by the end of the previous chunk
+                // belongs to the raw content, not to the regular token buffer.
+                checkRawContentBuffer(16);
+                QChar *rawContentDest = rawContent + rawContentSize;
+                parseEntity(src, rawContentDest);
+                rawContentSize = rawContentDest - rawContent;
+            } else {
+                parseEntity(src, dest);
+            }
         } else if (plaintext) {
             parseText(src);
         } else if (script) {
@@ -1870,8 +1952,7 @@ void HTMLTokenizer::write(const TokenizerString &str, bool appendData)
             if (pre) {
                 prePos++;
             }
-            *dest = *src;
-            fixUpChar(*dest);
+            *dest = fixUpChar(*src);
             ++dest;
             ++src;
         }
@@ -1942,16 +2023,15 @@ void HTMLTokenizer::finish()
         checkRawContentBuffer();
         rawContent[ rawContentSize ] = 0;
         rawContent[ rawContentSize + 1 ] = 0;
-        int pos;
         QString food;
         if (title || style || script || textarea) {
             rawContentSinceLastEntity = 0;
             food.setUnicode(rawContent, rawContentSize);
         } else if (server) {
-            food = "<";
+            food = QLatin1String("<");
             food += QString(rawContent, rawContentSize);
         } else {
-            pos = QString::fromRawData(rawContent, rawContentSize).indexOf('>');
+            const int pos = QString::fromRawData(rawContent, rawContentSize).indexOf(QLatin1Char('>'));
             food.setUnicode(rawContent + pos + 1, rawContentSize - pos - 1); // deep copy
         }
         KHTML_DELETE_QCHAR_VEC(rawContent);
@@ -1978,13 +2058,6 @@ void HTMLTokenizer::processToken()
         jsProxy->setEventHandlerLineno(tagStartLineno);
     }
     if (dest > buffer) {
-#if 0
-        if (currToken.tid) {
-            qDebug("unexpected token id: %d, str: *%s*", currToken.tid, QString::fromRawData(buffer, dest - buffer).toLatin1().constData());
-            assert(0);
-        }
-
-#endif
         currToken.text = new DOMStringImpl(buffer, dest - buffer);
         currToken.text->ref();
         if (currToken.tid != ID_COMMENT) {
@@ -2065,8 +2138,13 @@ HTMLTokenizer::~HTMLTokenizer()
 
 void HTMLTokenizer::enlargeBuffer(int len)
 {
-    int newsize = qMax(size * 2, size + len);
-    int oldoffs = (dest - buffer);
+    // 64 bit arithmetic: size * 2 can overflow int on very large inputs.
+    const qint64 wanted = qMax<qint64>(qint64(size) * 2, qint64(size) + len);
+    const int newsize = int(qMin<qint64>(wanted, sMaxBufferChars));
+    if (newsize < size + len) {
+        qFatal("HTMLTokenizer: token buffer limit exceeded");
+    }
+    const int oldoffs = (dest - buffer);
 
     buffer = KHTML_REALLOC_QCHAR_VEC(buffer, newsize);
     dest = buffer + oldoffs;
@@ -2075,7 +2153,11 @@ void HTMLTokenizer::enlargeBuffer(int len)
 
 void HTMLTokenizer::enlargeRawContentBuffer(int len)
 {
-    int newsize = qMax(rawContentMaxSize * 2, rawContentMaxSize + len);
+    const qint64 wanted = qMax<qint64>(qint64(rawContentMaxSize) * 2, qint64(rawContentMaxSize) + len);
+    const int newsize = int(qMin<qint64>(wanted, sMaxBufferChars));
+    if (newsize < rawContentMaxSize + len) {
+        qFatal("HTMLTokenizer: raw content buffer limit exceeded");
+    }
     rawContent = KHTML_REALLOC_QCHAR_VEC(rawContent, newsize);
     rawContentMaxSize = newsize;
 }
@@ -2103,7 +2185,7 @@ void HTMLTokenizer::notifyFinished(CachedObject *finishedObj)
         CachedScript *cs = cachedScript.dequeue();
         DOMString scriptSource = cs->script();
 #ifdef TOKEN_DEBUG
-        qCDebug(KHTML_LOG) << "External script is:" << endl << scriptSource.string();
+        qCDebug(KHTML_LOG) << "External script is:" << scriptSource.string();
 #endif
         setSrc(TokenizerString());
 
@@ -2184,4 +2266,3 @@ void HTMLTokenizer::setOnHold(bool _onHold)
     }
     onHold = _onHold;
 }
-
