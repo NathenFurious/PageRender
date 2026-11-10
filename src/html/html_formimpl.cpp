@@ -58,13 +58,11 @@
 #include <qmimedatabase.h>
 #include <QFile>
 #include <QDir>
+#include <QUrl>
 #include <QTextCodec>
 #include <QStandardPaths>
 #include <QTemporaryFile>
 #include <QKeyEvent>
-
-// for keygen
-#include <ksslkeygen.h>
 
 #include <assert.h>
 
@@ -127,78 +125,143 @@ long HTMLFormElementImpl::length() const
 {
     int len = 0;
     QListIterator<HTMLGenericFormElementImpl *> it(formElements);
-    while (it.hasNext())
+    while (it.hasNext()) {
         if (it.next()->isEnumerable()) {
             ++len;
         }
+    }
 
     return len;
 }
 
+// application/x-www-form-urlencoded encoding of one name or value.
+// https://www.w3.org/TR/html4/interact/forms.html#h-17.13.4.1
+// Safe characters are the ones NS treats as safe, for compatibility.
+// Every newline flavour (CRLF, lone CR, lone LF) is normalised to CRLF.
 static QByteArray encodeCString(const QByteArray &e)
 {
-    // https://www.w3.org/TR/html4/interact/forms.html#h-17.13.4.1
-    // safe characters like NS handles them for compatibility
-    static const char safe[] = "-._*";
-    QByteArray encoded((e.length() + e.count('\n')) * 3
-                       + e.count('\r') * 3 + 1, 0);
-    int enclen = 0;
-    bool crmissing = false;
-    unsigned char oldc;
-    unsigned char c = '\0';
+    static const char hex[] = "0123456789ABCDEF";
 
-    //QCString orig(e.data(), e.size());
+    QByteArray encoded;
+    encoded.reserve(e.size() * 3 + 8);
 
-    unsigned len = e.length();
-    for (unsigned pos = 0; pos < len; pos++) {
-        oldc = c;
-        c = e[pos];
+    bool crPending = false; // saw a CR; waiting to see whether an LF follows
 
-        if (crmissing && c != '\n') {
-            encoded[enclen++] = '%';
-            encoded[enclen++] = '0';
-            encoded[enclen++] = 'D';
-            crmissing = false;
+    const int len = e.size();
+    for (int pos = 0; pos < len; ++pos) {
+        const unsigned char c = static_cast<unsigned char>(e.at(pos));
+
+        if (crPending) {
+            crPending = false;
+            if (c != '\n') {
+                // lone CR: it was a newline on its own
+                encoded += "%0D%0A";
+            }
+            // CR LF: fall through, the LF below emits the pair
         }
 
-        if (((c >= 'A') && (c <= 'Z')) ||
-                ((c >= 'a') && (c <= 'z')) ||
-                ((c >= '0') && (c <= '9')) ||
-                (strchr(safe, c))
-           ) {
-            encoded[enclen++] = c;
-        } else if (c == ' ') {
-            encoded[enclen++] = '+';
+        if (c == '\r') {
+            crPending = true;
         } else if (c == '\n') {
-            encoded[enclen++] = '%';
-            encoded[enclen++] = '0';
-            encoded[enclen++] = 'D';
-            encoded[enclen++] = '%';
-            encoded[enclen++] = '0';
-            encoded[enclen++] = 'A';
-            crmissing = false;
-        } else if (c == '\r' && oldc != '\n') {
-            crmissing = true;
-        } else if (c != '\r') {
-            encoded[enclen++] = '%';
-            unsigned int h = c / 16;
-            h += (h > 9) ? ('A' - 10) : '0';
-            encoded[enclen++] = h;
-
-            unsigned int l = c % 16;
-            l += (l > 9) ? ('A' - 10) : '0';
-            encoded[enclen++] = l;
+            encoded += "%0D%0A";
+        } else if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                   c == '-' || c == '.' || c == '_' || c == '*') {
+            encoded += static_cast<char>(c);
+        } else if (c == ' ') {
+            encoded += '+';
+        } else {
+            // note: this includes NUL, which strchr(safe, 0) used to wave through as "safe"
+            encoded += '%';
+            encoded += hex[c >> 4];
+            encoded += hex[c & 0x0F];
         }
     }
-    encoded.truncate(enclen);
+
+    if (crPending) { // trailing lone CR used to be dropped
+        encoded += "%0D%0A";
+    }
+
     return encoded;
+}
+
+// Normalises CRLF / CR / LF to CRLF (used for enctype="text/plain").
+static QByteArray normalizeNewlines(const QByteArray &e)
+{
+    QByteArray out;
+    out.reserve(e.size() + e.size() / 8 + 1);
+    const int len = e.size();
+    for (int i = 0; i < len; ++i) {
+        const char c = e.at(i);
+        if (c == '\r') {
+            if (i + 1 < len && e.at(i + 1) == '\n') {
+                ++i;
+            }
+            out += "\r\n";
+        } else if (c == '\n') {
+            out += "\r\n";
+        } else {
+            out += c;
+        }
+    }
+    return out;
+}
+
+// Escapes a value that is placed inside the quotes of a multipart
+// Content-Disposition parameter. A raw '"', CR or LF there lets a field or file
+// name break out of the header (HTML spec: %22, %0D, %0A).
+static QByteArray escapeMultipartParam(const QByteArray &e)
+{
+    QByteArray out;
+    out.reserve(e.size() + 8);
+    const int len = e.size();
+    for (int i = 0; i < len; ++i) {
+        const char c = e.at(i);
+        switch (c) {
+        case '"':
+            out += "%22";
+            break;
+        case '\r':
+            out += "%0D";
+            break;
+        case '\n':
+            out += "%0A";
+            break;
+        default:
+            out += c;
+        }
+    }
+    return out;
+}
+
+// Maps the value of an <input type=file> to something KIO / QFile can use.
+static QUrl uploadUrlForValue(const QString &val)
+{
+    if (val.isEmpty()) {
+        return QUrl();
+    }
+
+    if (QDir::isRelativePath(val)) {
+        // Relative names are looked up in the documents folder. The old code
+        // concatenated without a separator ("Documents" + "foo" -> "Documentsfoo")
+        // and let ".." climb out of the folder.
+        const QString docs = QDir::cleanPath(QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation));
+        const QString candidate = QDir::cleanPath(docs + QLatin1Char('/') + val);
+        if (candidate.startsWith(docs + QLatin1Char('/')) && QFile::exists(candidate)) {
+            return QUrl::fromLocalFile(candidate);
+        }
+        return QUrl(val);
+    }
+
+    if (QDir::isAbsolutePath(val)) {
+        return QUrl::fromLocalFile(val);
+    }
+
+    return QUrl(val);
 }
 
 inline static QString ampersandEscape(unsigned val)
 {
-    QString out;
-    out.sprintf("&#%u;", val);
-    return out;
+    return QLatin1String("&#") + QString::number(val) + QLatin1Char(';');
 }
 
 inline static QString escapeUnencodeable(const QTextCodec *codec, const QString &s)
@@ -241,9 +304,7 @@ inline static QString escapeUnencodeable(const QTextCodec *codec, const QString 
 
 inline static QByteArray fixUpfromUnicode(const QTextCodec *codec, const QString &s)
 {
-    QByteArray str = codec->fromUnicode(escapeUnencodeable(codec, s));
-    str.truncate(str.length());
-    return str;
+    return codec->fromUnicode(escapeUnencodeable(codec, s));
 }
 
 Vector<HTMLGenericFormElementImpl *> HTMLFormElementImpl::gatherInTreeOrder(NodeImpl *root,
@@ -270,6 +331,7 @@ QByteArray HTMLFormElementImpl::formData(bool &ok)
     QByteArray enc_string; // used for non-multipart data
 
     bool useMultipart = m_multipart && m_post; // as multipart is ignored for GET
+    bool usePlainText = !useMultipart && m_post && strcasecmp(m_enctype, "text/plain") == 0;
 
     // find out the QTextcodec to use
     QString str = m_acceptcharset.string();
@@ -300,7 +362,7 @@ QByteArray HTMLFormElementImpl::formData(bool &ok)
         codec = KCharsets::charsets()->codecForName("UTF-8", codecOk);
     }
 
-    if (!codecOk) {
+    if (!codecOk || !codec) {
         codec = QTextCodec::codecForLocale();
     }
 
@@ -325,7 +387,7 @@ QByteArray HTMLFormElementImpl::formData(bool &ok)
 
     Vector<HTMLGenericFormElementImpl *> ordered = gatherInTreeOrder(this, formElementsSet);
 
-    if (ordered.size() < (unsigned)formElements.size()) {
+    if (ordered.size() < (unsigned)formElementsSet.size()) {
         // Some of our elements not contained within us due to parsing hijinks -- scan
         // the entire document.
         ordered = gatherInTreeOrder(document()->documentElement(), formElementsSet);
@@ -340,11 +402,23 @@ QByteArray HTMLFormElementImpl::formData(bool &ok)
             khtml::encodingList::ConstIterator it = lst.constBegin();
             const khtml::encodingList::ConstIterator itEnd = lst.constEnd();
             for (; it != itEnd; ++it) {
-                if (!useMultipart) {
+                if (usePlainText) {
+                    // enctype=text/plain: name=value CRLF, no percent-encoding
+                    const QByteArray name = *it;
+                    if (++it == itEnd) {
+                        break;
+                    }
+                    enc_string += normalizeNewlines(name);
+                    enc_string += '=';
+                    enc_string += normalizeNewlines(*it);
+                    enc_string += "\r\n";
+                } else if (!useMultipart) {
                     // handle ISINDEX / <input name=isindex> special
                     // but only if its the first entry
                     if (enc_string.isEmpty() && *it == "isindex") {
-                        ++it;
+                        if (++it == itEnd) {
+                            break;
+                        }
                         enc_string += encodeCString(*it);
                     } else {
                         if (!enc_string.isEmpty()) {
@@ -353,7 +427,10 @@ QByteArray HTMLFormElementImpl::formData(bool &ok)
 
                         enc_string += encodeCString(*it);
                         enc_string += '=';
-                        ++it;
+                        // the list is name,value pairs; never run off the end on an odd count
+                        if (++it == itEnd) {
+                            break;
+                        }
                         enc_string += encodeCString(*it);
                     }
                 } else {
@@ -361,25 +438,23 @@ QByteArray HTMLFormElementImpl::formData(bool &ok)
                     hstr += m_boundary.toLatin1();
                     hstr += "\r\n";
                     hstr += "Content-Disposition: form-data; name=\"";
-                    hstr += (*it).data();
+                    hstr += escapeMultipartParam(*it);
                     hstr += "\"";
 
                     // if the current type is FILE, then we also need to
                     // include the filename
                     if (current->id() == ID_INPUT &&
                             static_cast<HTMLInputElementImpl *>(current)->inputType() == HTMLInputElementImpl::FILE) {
-                        QUrl path;
-                        QString val = static_cast<HTMLInputElementImpl *>(current)->value().string().trimmed();
-                        if (!val.isEmpty() &&
-                                QDir::isRelativePath(val) &&
-                                QFile::exists(QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) + val)) {
-                            path.setPath(QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) + val);
-                        } else {
-                            path = QUrl(val);
-                        }
+                        const QString val = static_cast<HTMLInputElementImpl *>(current)->value().string().trimmed();
+                        const QUrl path = uploadUrlForValue(val);
 
-                        hstr += fixUpfromUnicode(codec, "; filename=\"" + path.fileName() + "\"");
-                        if (path.isValid()) {
+                        hstr += "; filename=\"";
+                        hstr += escapeMultipartParam(fixUpfromUnicode(codec, path.fileName()));
+                        hstr += "\"";
+
+                        const bool exists = path.isValid() && !path.isEmpty() &&
+                                            (!path.isLocalFile() || QFile::exists(path.toLocalFile()));
+                        if (exists) {
                             fileUploads << path.toDisplayString(QUrl::PreferLocalFile);
                             QMimeDatabase db;
                             const QMimeType mime = db.mimeTypeForUrl(path);
@@ -388,12 +463,14 @@ QByteArray HTMLFormElementImpl::formData(bool &ok)
                                 hstr += mime.name().toLatin1().constData();
                             }
                         } else if (!val.isEmpty()) {
-                            fileNotUploads << path.toDisplayString(QUrl::PreferLocalFile);
+                            fileNotUploads << (path.isEmpty() ? val : path.toDisplayString(QUrl::PreferLocalFile));
                         }
                     }
 
                     hstr += "\r\n\r\n";
-                    ++it;
+                    if (++it == itEnd) {
+                        break;
+                    }
 
                     // append body
                     form_data.append(hstr);
@@ -559,6 +636,7 @@ void HTMLFormElementImpl::submitFromKeyboard()
             case HTMLInputElementImpl::TEXT:
             case HTMLInputElementImpl::PASSWORD:
                 ++inputtext;
+                break;
             default:
                 break;
             }
@@ -771,6 +849,7 @@ void HTMLFormElementImpl::parseAttribute(AttributeImpl *attr)
         }
         m_name = attr->value();
     //Fallthrough intentional
+    // fall through
     default:
         HTMLElementImpl::parseAttribute(attr);
     }
@@ -814,7 +893,11 @@ void HTMLFormElementImpl::uncheckOtherRadioButtonsInGroup(HTMLGenericFormElement
 
 void HTMLFormElementImpl::registerFormElement(HTMLGenericFormElementImpl *e)
 {
-    formElements.append(e);
+    // The parser re-registers elements when it reparents residual-style content;
+    // a duplicate entry inflated length() and forced the whole-document scan in formData().
+    if (!formElements.contains(e)) {
+        formElements.append(e);
+    }
 }
 
 void HTMLFormElementImpl::removeFormElement(HTMLGenericFormElementImpl *e)
@@ -991,18 +1074,15 @@ HTMLFormElementImpl *HTMLGenericFormElementImpl::getForm() const
     return nullptr;
 }
 
+// The name is always read from the attribute. A cached copy (m_name) used to
+// take precedence, so a later setAttribute("name", ...) was silently ignored
+// once setName() had run. m_name stays null now; the member is kept only so the
+// header does not have to change.
 DOMString HTMLGenericFormElementImpl::name() const
 {
-    if (m_name) {
-        return m_name;
-    }
-
-// ###
-//     DOMString n = document()->htmlMode() != DocumentImpl::XHtml ?
-//                   getAttribute(ATTR_NAME) : getAttribute(ATTR_ID);
     const DOMString n = getAttribute(ATTR_NAME);
     if (n.isNull()) {
-        return new DOMStringImpl("");
+        return DOMString("");
     }
 
     return n;
@@ -1010,14 +1090,7 @@ DOMString HTMLGenericFormElementImpl::name() const
 
 void HTMLGenericFormElementImpl::setName(const DOMString &name)
 {
-    if (m_name) {
-        m_name->deref();
-    }
-    m_name = name.implementation();
     setAttribute(ATTR_NAME, name);
-    if (m_name) {
-        m_name->ref();
-    }
 }
 
 void HTMLGenericFormElementImpl::onSelect()
@@ -1101,6 +1174,7 @@ void HTMLGenericFormElementImpl::defaultEventHandler(EventImpl *evt)
             if (static_cast<RenderWidget *>(renderer())->handleEvent(*evt)) {
                 evt->setDefaultHandled();
             }
+            break;
         default:
             break;
         }
@@ -1449,6 +1523,7 @@ QString HTMLInputElementImpl::state()
             document()->view()->addFormCompletionItem(name().string(), value().string());
         }
     /* nobreak */
+    // fall through
     default:
         return value().string() + (m_unsubmittedFormChange ? 'M' : '.') + (value().isNull() ? 'N' : '.');
     }
@@ -1462,8 +1537,9 @@ void HTMLInputElementImpl::restoreState(const QString &state)
         setChecked((state == QLatin1String("on")));
         break;
     case FILE:
-        m_value = DOMString(state.left(state.length() - 2));
-        setChanged();
+        // Never restore a file input from saved session state: that would let a
+        // stale/forged state silently re-arm an upload of a local path without
+        // the user choosing the file again. (Other browsers don't restore it either.)
         break;
     case HIDDEN:
     case PASSWORD:
@@ -1536,6 +1612,12 @@ void HTMLInputElementImpl::parseAttribute(AttributeImpl *attr)
     break;
     case ATTR_SIZE:
         m_size = attr->val() ? attr->val()->toInt() : 20;
+        // a zero/negative/huge size used to reach the line-edit sizing code unchecked
+        if (m_size <= 0) {
+            m_size = 20;
+        } else if (m_size > 32767) {
+            m_size = 32767;
+        }
         break;
     case ATTR_ALT:
     case ATTR_SRC:
@@ -1586,8 +1668,10 @@ void HTMLInputElementImpl::copyNonAttributeProperties(const ElementImpl *source)
 
     m_value = e->m_value;
     m_checked = e->m_checked;
-    m_defaultChecked = e->m_checked;
-    m_useDefaultChecked = e->m_defaultChecked;
+    // these two were crossed over (m_defaultChecked = e->m_checked, ...) which gave
+    // cloned checkboxes/radios the wrong default state
+    m_defaultChecked = e->m_defaultChecked;
+    m_useDefaultChecked = e->m_useDefaultChecked;
     m_indeterminate = e->m_indeterminate;
     // ### copy more?
 
@@ -1605,13 +1689,15 @@ void HTMLInputElementImpl::attach()
         // after attachment?
         if ((uint) m_type <= ISINDEX && !m_value.isEmpty()) {
             const QString value = m_value.string();
-            // remove newline stuff..
+            // remove newline stuff.. (only line breaks, as the spec says; this used
+            // to drop every control character including tabs)
             QString nvalue;
             unsigned int valueLength = value.length();
-            for (unsigned int i = 0; i < valueLength; ++i)
-                if (value[i] >= ' ') {
+            for (unsigned int i = 0; i < valueLength; ++i) {
+                if (value[i] != QLatin1Char('\n') && value[i] != QLatin1Char('\r')) {
                     nvalue += value[i];
                 }
+            }
             m_value = nvalue;
         }
         m_defaultChecked = (getAttribute(ATTR_CHECKED) != nullptr);
@@ -1635,6 +1721,7 @@ void HTMLInputElementImpl::attach()
         if (!getAttribute(ATTR_HEIGHT).isNull()) {
             addCSSLength(CSS_PROP_HEIGHT, getAttribute(ATTR_HEIGHT));
         }
+        break;
     default:
         break;
     };
@@ -1652,13 +1739,14 @@ void HTMLInputElementImpl::attach()
         case IMAGE:       m_render =  new(document()->renderArena()) RenderImageButton(this); break;
         case RESET:      m_render = new(document()->renderArena()) RenderResetButton(this);   break;
         case FILE:         m_render =  new(document()->renderArena()) RenderFileButton(this);    break;
-        case BUTTON:  m_render = new(document()->renderArena()) RenderPushButton(this);
+        case BUTTON:  m_render = new(document()->renderArena()) RenderPushButton(this); break;
         case HIDDEN:   break;
         }
     }
 
-    // Let check and radio boxes start indeterminate
-    setIndeterminate(true);
+    // Check and radio boxes start out *not* indeterminate (setIndeterminate() used to be a
+    // no-op because of a broken condition, so this has always been the effective behaviour).
+    setIndeterminate(false);
 
     if (m_render) {
         m_render->setStyle(_style);
@@ -1761,32 +1849,26 @@ bool HTMLInputElementImpl::encoding(const QTextCodec *codec, khtml::encodingList
         break;
 
     case FILE: { // hmm, we have the type FILE also.  bad choice here...
-        QString local;
-        QUrl fileurl;
-        QString val = value().string();
-        if (!val.isEmpty() &&
-                QDir::isRelativePath(val) &&
-                QFile::exists(QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) + val)) {
-            fileurl.setPath(QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) + val);
-        } else {
-            fileurl = QUrl(val);
-        }
+        const QUrl fileurl = uploadUrlForValue(value().string());
 
         // can't submit file in www-url-form encoded
-        QWidget *const toplevel = document()->view() ? document()->view()->topLevelWidget() : nullptr;
         if (multipart) {
             QByteArray filearray;
-            KIO::StatJob *job = KIO::stat(fileurl);
-            KJobWidgets::setWindow(job, toplevel);
 
-            if (job->exec()) {
-                const KFileItem fileitem(job->statResult(), fileurl, true, false);
-                if (fileitem.isFile()) {
-                    QTemporaryFile tmpFile;
-                    if (tmpFile.open()) {
-                        KIO::FileCopyJob *job = KIO::file_copy(fileurl, QUrl::fromLocalFile(tmpFile.fileName()), -1, KIO::Overwrite);
-                        if (job->exec()) {
-                            filearray = tmpFile.read(tmpFile.size());
+            if (!fileurl.isEmpty()) {
+                QWidget *const toplevel = document()->view() ? document()->view()->topLevelWidget() : nullptr;
+                KIO::StatJob *statJob = KIO::stat(fileurl);
+                KJobWidgets::setWindow(statJob, toplevel);
+
+                if (statJob->exec()) {
+                    const KFileItem fileitem(statJob->statResult(), fileurl, true, false);
+                    if (fileitem.isFile()) {
+                        QTemporaryFile tmpFile;
+                        if (tmpFile.open()) {
+                            KIO::FileCopyJob *copyJob = KIO::file_copy(fileurl, QUrl::fromLocalFile(tmpFile.fileName()), -1, KIO::Overwrite);
+                            if (copyJob->exec()) {
+                                filearray = tmpFile.read(tmpFile.size());
+                            }
                         }
                     }
                 }
@@ -1794,7 +1876,11 @@ bool HTMLInputElementImpl::encoding(const QTextCodec *codec, khtml::encodingList
             encoding += filearray;
             return true;
         }
-        // else fall through
+
+        // Not multipart: send only the file *name*, never the full local path
+        // (this branch used to fall through and leak the whole path to the server).
+        encoding += fixUpfromUnicode(codec, fileurl.fileName());
+        return true;
     }
     case HIDDEN:
     case TEXT:
@@ -1823,7 +1909,7 @@ void HTMLInputElementImpl::reset()
     }
     m_useDefaultChecked = true;
     m_checked = m_defaultChecked;
-    setIndeterminate(true);
+    setIndeterminate(false);
 }
 
 void HTMLInputElementImpl::setChecked(bool _checked, bool setDefaultChecked)
@@ -1874,7 +1960,8 @@ void HTMLInputElementImpl::setChecked(bool _checked, bool setDefaultChecked)
 void HTMLInputElementImpl::setIndeterminate(bool _indeterminate)
 {
     // Only checkboxes and radio-boxes honor indeterminate.
-    if (inputType() != CHECKBOX || inputType() != RADIO || indeterminate() == _indeterminate) {
+    // (This was "!= CHECKBOX || != RADIO", which is always true, so the setter never did anything.)
+    if ((inputType() != CHECKBOX && inputType() != RADIO) || indeterminate() == _indeterminate) {
         return;
     }
 
@@ -2169,15 +2256,21 @@ NodeImpl *HTMLLabelElementImpl::getFormElement()
         newNode = document()->getElementById(formElementId);
     }
     if (!newNode) {
-        const uint children = childNodeCount();
-        if (children > 1)
-            for (unsigned int i = 0; i < children; ++i) {
-                const uint nodeId = childNode(i)->id();
-                if (nodeId == ID_INPUT || nodeId == ID_SELECT || nodeId == ID_TEXTAREA) {
-                    newNode = childNode(i);
-                    break;
-                }
+        // The labelled control may be any descendant. This used to require *more than
+        // one* direct child ("children > 1"), so the very common <label><input></label>
+        // never matched, and nested controls were never found.
+        for (NodeImpl *n = firstChild(); n; n = n->traverseNextNode(this)) {
+            const uint nodeId = n->id();
+            if (nodeId == ID_SELECT || nodeId == ID_TEXTAREA) {
+                newNode = n;
+                break;
             }
+            if (nodeId == ID_INPUT &&
+                    static_cast<HTMLInputElementImpl *>(n)->inputType() != HTMLInputElementImpl::HIDDEN) {
+                newNode = n;
+                break;
+            }
+        }
     }
     return newNode;
 }
@@ -2420,13 +2513,16 @@ void HTMLSelectElementImpl::setValue(DOMStringImpl *value)
     // find the option with value() matching the given parameter
     // and make it the current selection.
     const QVector<HTMLGenericFormElementImpl *> items = listItems();
-    for (int i = 0; i < items.size(); i++)
+    for (int i = 0; i < items.size(); i++) {
         if (items[i]->id() == ID_OPTION && static_cast<HTMLOptionElementImpl *>(items[i])->value() == value) {
             static_cast<HTMLOptionElementImpl *>(items[i])->setSelected(true);
             return;
         }
+    }
 }
 
+// Positional encoding: exactly one character per *list item* (options and
+// optgroups alike), 'X' for a selected option, '.' otherwise.
 QString HTMLSelectElementImpl::state()
 {
     QString state;
@@ -2445,10 +2541,11 @@ QString HTMLSelectElementImpl::state()
 
     // Otherwise we merely go positional..
     state.fill('.', l);
-    for (int i = 0; i < l; ++i)
+    for (int i = 0; i < l; ++i) {
         if (items[i]->id() == ID_OPTION && static_cast<HTMLOptionElementImpl *>(items[i])->selectedBit()) {
             state[i] = 'X';
         }
+    }
 
     return state;
 }
@@ -2483,16 +2580,22 @@ void HTMLSelectElementImpl::restoreState(const QString &_state)
         return;
     }
 
-    if (!state.isEmpty() && !state.contains('X') && !m_multiple && m_size <= 1) {
-        qWarning("should not happen in restoreState!");
-        state[0] = 'X';
+    // Now we have positional encoding. state() writes one character per list item
+    // (options *and* optgroups), so that is what the length has to match. This used to
+    // compare against the option count only: selects with optgroups never restored, and
+    // the loop below then indexed past the end of the string.
+    if (state.length() != l) {
+        return;
     }
 
-    // Now we have positional encoding. Make sure the length matches.
-    if (m_length != state.length()) // m_length == number of <option>, while
-        // l == items.length() includes optgroups, too.
-    {
-        return;
+    if (!state.isEmpty() && !state.contains('X') && !m_multiple && m_size <= 1) {
+        qCWarning(KHTML_LOG) << "should not happen in restoreState!";
+        for (int i = 0; i < l; ++i) {
+            if (items[i]->id() == ID_OPTION) {
+                state[i] = 'X'; // first real option, not necessarily list position 0
+                break;
+            }
+        }
     }
 
     for (int i = 0; i < l; ++i) {
@@ -2671,10 +2774,11 @@ int HTMLSelectElementImpl::listToOptionIndex(int listIndex) const
 
     int optionIndex = 0; // actual index of option not counting OPTGROUP entries that may be in list
     int i;
-    for (i = 0; i < listIndex; i++)
+    for (i = 0; i < listIndex; i++) {
         if (items[i]->id() == ID_OPTION) {
             optionIndex++;
         }
+    }
     return optionIndex;
 }
 
@@ -2782,58 +2886,8 @@ void HTMLSelectElementImpl::notifyOptionSelected(HTMLOptionElementImpl *selected
 }
 
 // -------------------------------------------------------------------------
-
-HTMLKeygenElementImpl::HTMLKeygenElementImpl(DocumentImpl *doc, HTMLFormElementImpl *f)
-    : HTMLSelectElementImpl(doc, f)
-{
-    const QStringList keys = KSSLKeyGen::supportedKeySizes();
-    QStringList::ConstIterator i = keys.begin();
-    const QStringList::ConstIterator iEnd = keys.end();
-    for (; i != iEnd; ++i) {
-        HTMLOptionElementImpl *const o = new HTMLOptionElementImpl(doc, form());
-        addChild(o);
-        o->addChild(doc->createTextNode(DOMString(*i).implementation()));
-    }
-}
-
-NodeImpl::Id HTMLKeygenElementImpl::id() const
-{
-    return ID_KEYGEN;
-}
-
-void HTMLKeygenElementImpl::parseAttribute(AttributeImpl *attr)
-{
-    switch (attr->id()) {
-    case ATTR_CHALLENGE:
-        break;
-    default:
-        // skip HTMLSelectElementImpl parsing!
-        HTMLGenericFormElementImpl::parseAttribute(attr);
-    }
-}
-
-bool HTMLKeygenElementImpl::encoding(const QTextCodec *codec, khtml::encodingList &encoded_values, bool)
-{
-    bool successful = false;
-    const QByteArray enc_name = fixUpfromUnicode(codec, name().string());
-
-    encoded_values += enc_name;
-
-    // pop up the fancy certificate creation dialog here
-    KSSLKeyGen *const kg = new KSSLKeyGen(static_cast<RenderWidget *>(m_render)->widget());
-    kg->setWindowTitle(i18n("Key Generator"));
-    kg->setModal(true);
-
-    kg->setKeySize(0);
-    successful = (QDialog::Accepted == kg->exec());
-
-    delete kg;
-
-    encoded_values += "deadbeef";
-
-    return successful;
-}
-
+// (HTMLKeygenElementImpl was removed: <keygen> is gone from the web platform
+// and the old implementation submitted a fake "deadbeef" key.)
 // -------------------------------------------------------------------------
 
 NodeImpl::Id HTMLOptGroupElementImpl::id() const
@@ -2874,9 +2928,16 @@ DOMString HTMLOptionElementImpl::text() const
 
 long HTMLOptionElementImpl::index() const
 {
+    // An option that isn't inside a <select> (e.g. one made with createElement)
+    // has no select to ask; this used to dereference a null pointer.
+    HTMLSelectElementImpl *const select = getSelect();
+    if (!select) {
+        return 0;
+    }
+
     // Let's do this dynamically. Might be a bit slow, but we're sure
     // we won't forget to update a member variable in some cases...
-    const QVector<HTMLGenericFormElementImpl *> items = getSelect()->listItems();
+    const QVector<HTMLGenericFormElementImpl *> items = select->listItems();
     const int l = items.count();
     int optionIndex = 0;
     for (int i = 0; i < l; ++i) {
@@ -3035,7 +3096,7 @@ void HTMLTextAreaElementImpl::parseAttribute(AttributeImpl *attr)
         if (attr->val()) {
             m_rows = DOMString(attr->val()).string().toInt();
         }
-        if (!m_rows) {
+        if (m_rows <= 0) {
             m_rows = 2;
         }
         if (renderer()) {
@@ -3047,7 +3108,7 @@ void HTMLTextAreaElementImpl::parseAttribute(AttributeImpl *attr)
         if (attr->val()) {
             m_cols = DOMString(attr->val()).string().toInt();
         }
-        if (!m_cols) {
+        if (m_cols <= 0) {
             m_cols = 20;
         }
         if (renderer()) {
@@ -3104,35 +3165,33 @@ void HTMLTextAreaElementImpl::attach()
     _style->deref();
 }
 
+// LF -> CRLF (lone CRs are dropped, as before)
 static QString expandLF(const QString &s)
 {
-    // LF -> CRLF
-    unsigned crs = s.count('\n');
-    if (crs == 0) {
+    if (!s.contains(QLatin1Char('\n'))) {
         return s;
     }
-    unsigned len = s.length();
+
+    const int len = s.length();
 
     QString r;
-    r.reserve(len + crs + 1);
-    unsigned pos2 = 0;
-    for (unsigned pos = 0; pos < len; pos++) {
-        QChar c = s.at(pos);
+    r.reserve(len + s.count(QLatin1Char('\n')) + 1);
+    for (int pos = 0; pos < len; ++pos) {
+        const QChar c = s.at(pos);
         switch (c.unicode()) {
         case '\n':
-            r[pos2++] = '\r';
-            r[pos2++] = '\n';
+            r.append(QLatin1Char('\r'));
+            r.append(QLatin1Char('\n'));
             break;
 
         case '\r':
             break;
 
         default:
-            r[pos2++] = c;
+            r.append(c);
             break;
         }
     }
-    r.squeeze();
     return r;
 }
 
@@ -3192,10 +3251,11 @@ DOMString HTMLTextAreaElementImpl::defaultValue()
     DOMString val = "";
     // there may be comments - just grab the text nodes
     NodeImpl *n;
-    for (n = firstChild(); n; n = n->nextSibling())
+    for (n = firstChild(); n; n = n->nextSibling()) {
         if (n->isTextNode()) {
             val += static_cast<TextImpl *>(n)->data();
         }
+    }
 
     if (val[0] == '\r' && val[1] == '\n') {
         val = val.copy();
@@ -3213,10 +3273,11 @@ void HTMLTextAreaElementImpl::setDefaultValue(DOMString _defaultValue)
     // there may be comments - remove all the text nodes and replace them with one
     QList<NodeImpl *> toRemove;
     NodeImpl *n;
-    for (n = firstChild(); n; n = n->nextSibling())
+    for (n = firstChild(); n; n = n->nextSibling()) {
         if (n->isTextNode()) {
             toRemove.append(n);
         }
+    }
     QListIterator<NodeImpl *> it(toRemove);
     int exceptioncode = 0;
     while (it.hasNext()) {
@@ -3339,4 +3400,3 @@ void HTMLIsIndexElementImpl::setPrompt(const DOMString &str)
 }
 
 // -------------------------------------------------------------------------
-
