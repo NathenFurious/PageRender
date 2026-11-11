@@ -24,6 +24,24 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+// Hardening / correctness pass (no header changes required). Summary:
+//
+//  * Preloads now use the document-relative *completed* URL, the same one the real
+//    tokenizer requests later (HTMLTokenizer::scriptHandler uses completeURL()), so
+//    a preloaded object is actually the one that gets reused instead of a wasted
+//    request for a relative URL that never matches.
+//  * A src/href found on an END tag (e.g. "</img src=x>") no longer lingers in
+//    m_urlToLoad and gets attached to the next unrelated start tag.
+//  * Numeric entities saturate instead of wrapping around unsigned arithmetic
+//    (a long digit run could previously wrap into a "legal" code point).
+//  * Null checks for the part and the document loader (documents without a view,
+//    e.g. innerHTML or detached documents).
+//  * @import preload no longer registers a null object; CSS rule / value buffers
+//    are bounded so hostile stylesheets cannot grow them without limit.
+//  * processAttribute(): missing break after ID_LINK made it fall into default
+//    (harmless, but fragile) - fixed.
+//  * m_stateBeforeEntityInAttributeValue is initialised in reset().
+
 #include "htmlprospectivetokenizer.h"
 
 #include <QTime>
@@ -53,6 +71,10 @@
 #define U16_LEAD(sup) (ushort)(((sup)>>10)+0xd7c0)
 
 using namespace khtml;
+
+// Bounds for the tiny CSS @rule scanner. Anything longer cannot be a rule we care about.
+static const int sMaxCssRuleNameLength = 32;
+static const int sMaxCssRuleValueLength = 4096;
 
 ProspectiveTokenizer::ProspectiveTokenizer(DOM::DocumentImpl *doc)
     : m_inProgress(false)
@@ -95,6 +117,7 @@ void ProspectiveTokenizer::reset()
     m_source.clear();
 
     m_state = Data;
+    m_stateBeforeEntityInAttributeValue = Data;
     m_escape = false;
     m_contentModel = PCDATA;
     m_commentPos = 0;
@@ -175,6 +198,25 @@ static inline unsigned legalEntityFor(unsigned value)
     return value;
 }
 
+// value * base + digit, saturating just above the highest code point so a long run of
+// digits can never wrap around into a valid-looking value.
+static inline unsigned accumulateDigit(unsigned value, unsigned base, unsigned digit)
+{
+    value = value * base + digit;   // value <= 0x110000 and base <= 16: cannot overflow
+    return value > 0x10FFFF ? 0x110000 : value;
+}
+
+static inline QString documentEncoding(DOM::DocumentImpl *doc)
+{
+    return doc->part() ? doc->part()->encoding() : QString();
+}
+
+// Preloads must request the same (absolute) URL that the real load will request later.
+static inline DOMString completeUrl(DOM::DocumentImpl *doc, const DOMString &url)
+{
+    return DOMString(doc->completeURL(url.string()));
+}
+
 unsigned ProspectiveTokenizer::consumeEntity(TokenizerString &source, bool &notEnoughCharacters)
 {
     enum EntityState {
@@ -233,11 +275,11 @@ unsigned ProspectiveTokenizer::consumeEntity(TokenizerString &source, bool &notE
             break;
         case Hex:
             if (cc >= '0' && cc <= '9') {
-                result = result * 16 + cc - '0';
+                result = accumulateDigit(result, 16, cc - '0');
             } else if (cc >= 'a' && cc <= 'f') {
-                result = result * 16 + 10 + cc - 'a';
+                result = accumulateDigit(result, 16, 10 + cc - 'a');
             } else if (cc >= 'A' && cc <= 'F') {
-                result = result * 16 + 10 + cc - 'A';
+                result = accumulateDigit(result, 16, 10 + cc - 'A');
             } else if (cc == ';') {
                 source.advance();
                 return legalEntityFor(result);
@@ -247,7 +289,7 @@ unsigned ProspectiveTokenizer::consumeEntity(TokenizerString &source, bool &notE
             break;
         case Decimal:
             if (cc >= '0' && cc <= '9') {
-                result = result * 10 + cc - '0';
+                result = accumulateDigit(result, 10, cc - '0');
             } else if (cc == ';') {
                 source.advance();
                 return legalEntityFor(result);
@@ -739,8 +781,11 @@ void ProspectiveTokenizer::processAttribute()
             DOMStringImpl *lowerAttribute = DOMStringImpl(DOMStringImpl::ShallowCopy, m_attributeValue.data(), m_attributeValue.size()).lower();
             QString val = lowerAttribute->string();
             delete lowerAttribute;
-            m_linkIsStyleSheet = val.contains("stylesheet") && !val.contains("alternate") && !val.contains("icon");
+            m_linkIsStyleSheet = val.contains(QLatin1String("stylesheet")) &&
+                                 !val.contains(QLatin1String("alternate")) &&
+                                 !val.contains(QLatin1String("icon"));
         }
+        break;
     }
     default:
         break;
@@ -802,7 +847,7 @@ inline void ProspectiveTokenizer::tokenizeCSS(QChar c)
             m_cssState = CSSAfterRule;
         } else if (c == ';') {
             m_cssState = CSSInitial;
-        } else {
+        } else if (m_cssRule.size() < sMaxCssRuleNameLength) {
             m_cssRule.append(c);
         }
         break;
@@ -822,7 +867,7 @@ inline void ProspectiveTokenizer::tokenizeCSS(QChar c)
         } else if (c == ';') {
             emitCSSRule();
             m_cssState = CSSInitial;
-        } else {
+        } else if (m_cssRuleValue.size() < sMaxCssRuleValueLength) {
             m_cssRuleValue.append(c);
         }
         break;
@@ -846,6 +891,10 @@ void ProspectiveTokenizer::emitTag()
         m_contentModel = PCDATA;
         m_cssState = CSSInitial;
         clearLastCharacters();
+        // Attributes on an end tag ("</img src=x>") are junk: never let them leak
+        // into the next start tag.
+        m_urlToLoad = DOMString();
+        m_linkIsStyleSheet = false;
         return;
     }
 
@@ -885,16 +934,19 @@ void ProspectiveTokenizer::emitTag()
     }
 
     CachedObject *o = nullptr;
-    if (tag == ID_SCRIPT) {
-        o = m_document->docLoader()->requestScript(m_urlToLoad, m_document->part()->encoding());
-    } else if (tag == ID_IMAGE || tag == ID_IMG) {
-        o = m_document->docLoader()->requestImage(m_urlToLoad);
-    } else if (tag == ID_LINK && m_linkIsStyleSheet) {
-        o = m_document->docLoader()->requestStyleSheet(m_urlToLoad, m_document->part()->encoding());
-    }
+    if (m_document->docLoader()) {
+        const DOMString url = completeUrl(m_document, m_urlToLoad);
+        if (tag == ID_SCRIPT) {
+            o = m_document->docLoader()->requestScript(url, documentEncoding(m_document));
+        } else if (tag == ID_IMAGE || tag == ID_IMG) {
+            o = m_document->docLoader()->requestImage(url);
+        } else if (tag == ID_LINK && m_linkIsStyleSheet) {
+            o = m_document->docLoader()->requestStyleSheet(url, documentEncoding(m_document));
+        }
 
-    if (o) {
-        m_document->docLoader()->registerPreload(o);
+        if (o) {
+            m_document->docLoader()->registerPreload(o);
+        }
     }
 
     m_urlToLoad = DOMString();
@@ -904,14 +956,17 @@ void ProspectiveTokenizer::emitTag()
 void ProspectiveTokenizer::emitCSSRule()
 {
     QString rule(m_cssRule.data(), m_cssRule.size());
-    if (rule.toLower() == "import" && !m_cssRuleValue.isEmpty()) {
+    if (rule.toLower() == QLatin1String("import") && !m_cssRuleValue.isEmpty() && m_document->docLoader()) {
         DOMString value = DOMString(m_cssRuleValue.data(), m_cssRuleValue.size());
         DOMString url = parseURL(value);
         if (!url.isEmpty()) {
-            m_document->docLoader()->registerPreload(m_document->docLoader()->requestStyleSheet(url, m_document->part()->encoding()));    // #### charset
+            CachedObject *o = m_document->docLoader()->requestStyleSheet(completeUrl(m_document, url),
+                              documentEncoding(m_document));    // #### charset
+            if (o) {
+                m_document->docLoader()->registerPreload(o);
+            }
         }
     }
     m_cssRule.clear();
     m_cssRuleValue.clear();
 }
-
